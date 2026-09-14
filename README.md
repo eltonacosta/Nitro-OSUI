@@ -181,10 +181,35 @@ On systems without udev the rule cannot be installed; in that case the GUI falls
 
 Both interfaces share the same driver code (`main/nitro_core.py`), so features and validation rules stay in one place.
 
+## Fan curve
+
+The firmware only offers "automatic" or a fixed speed per fan — there is no curve in the driver — so nitroctl applies one from userspace. The GUI has a **Fan curve** card with **7 levels per fan** (CPU and GPU), each level with an editable temperature and fan speed; the same levels are editable from the CLI (menu item `7`).
+
+Rules enforced by the engine (`main/fan_curve.py`):
+
+* **Never below 20%.** The editor cannot go lower, and the interpolated result is clamped to 20-100%.
+* **Suspended GPU** (the sensor reports 0, normal when the dGPU sleeps) keeps that fan at a fixed 40% idle speed instead of chasing a reading that does not exist.
+* **Failed reading** (CPU temperature unavailable, or no sensor at all) ramps both fans to 75% as a fail-safe.
+* **Write discipline.** The embedded controller has no rate limiting, so the engine writes only when the value actually changes, at most once every 5 s, with 2 °C of hysteresis on the way down.
+
+Values are interpolated linearly between levels; editing takes effect immediately, without restarting anything.
+
+The curve keeps being applied with the GUI closed: a small daemon (`nitroctl-curve`) starts with your session through XDG autostart (`~/.config/autostart/nitroctl-curve.desktop`), which works on GNOME, KDE, Xfce, Sway and friends without systemd. Useful commands:
+
+```bash
+nitroctl-curve --status        # show the levels and the last report
+nitroctl-curve --once          # apply a single tick (testing/diagnostics)
+nitroctl-curve --restore-auto  # hand both fans back to the firmware
+```
+
+Only one writer exists at a time, guaranteed by a lock (`~/.cache/nitroctl/curve.lock`): while the daemon runs, the GUI edits the configuration and displays the daemon's live state. Turning the curve off — or closing the process that applies it — hands the fans back to the firmware (`0,0`). `./setup/install.sh --no-autostart` skips the autostart entry, and `--uninstall` removes it.
+
 ## To Do
 
 * [❌] Keyboard RGB
 * [✅] ~~GUI~~
-* [❌] CPU&GPU Temparatures on main menu
+* [✅] ~~CPU & GPU temperatures (live sensors card in the GUI, refreshed every 800 ms)~~
+* [✅] ~~Fan curve: 7 levels per fan, minimum 20%, applied by a background daemon~~
+* [❌] Temperatures and fan RPM in the CLI main menu
 * [✅] ~~Finish the installation guide~~
 * [✅] ~~Configuration Save/Load function~~

@@ -3,6 +3,7 @@ import sys
 import subprocess
 import time
 
+import fan_curve
 import nitro_core as core
 
 
@@ -23,8 +24,15 @@ def chk_os():
 
 
 def chk_su():
-    if not core.is_root():
-        print("ERROR: Fatal: nitroctl requires root privileges. Exiting.", file=sys.stderr)
+    # Com a regra udev o usuário é dono dos nós do driver e escreve sem elevar;
+    # root continua valendo. Só aborta quando nenhum dos dois é possível.
+    if not core.can_control():
+        print(
+            "ERROR: Fatal: no write access to the driver. Run "
+            "'./setup/install.sh --driver-only' once (it asks for your password) "
+            "or run nitroctl as root. Exiting.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
 
@@ -197,6 +205,145 @@ def fan_speed_menu():
     time.sleep(1)
 
 
+def _parse_int(raw, low, high):
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if low <= value <= high else None
+
+
+def _save_curve(config):
+    try:
+        fan_curve.save_config(config)
+        print(f"Curve saved to {fan_curve.config_path()}.")
+    except (fan_curve.CurveConfigError, OSError) as exc:
+        print(f"ERROR: {exc}")
+    time.sleep(1)
+
+
+def _edit_curve_levels(config, device):
+    cls()
+    points = config.points(device)
+    print(f"{device.upper()} curve: {fan_curve.LEVELS} levels")
+    print(f"Temperatures must increase; speeds are {fan_curve.MIN_SPEED}-{fan_curve.MAX_SPEED}%.")
+    print("Press enter on an empty answer to keep the current value.\n")
+
+    updated = []
+    previous_temp = None
+    for index in range(fan_curve.LEVELS):
+        old_temp, old_speed = points[index]
+        temp_raw = ask(f"Level {index + 1} temperature in °C [{old_temp}]: ")
+        if temp_raw is None:
+            print("Cancelled. Nothing changed.")
+            time.sleep(1)
+            return
+        temp_raw = temp_raw.strip()
+        temp = old_temp if temp_raw == "" else _parse_int(temp_raw, fan_curve.MIN_TEMP, fan_curve.MAX_TEMP)
+        if temp is None:
+            print(f"Invalid temperature (range {fan_curve.MIN_TEMP}-{fan_curve.MAX_TEMP}). Nothing changed.")
+            time.sleep(1)
+            return
+        if previous_temp is not None and temp <= previous_temp:
+            print(f"Temperature must be greater than {previous_temp} °C. Nothing changed.")
+            time.sleep(1)
+            return
+        speed_raw = ask(f"Level {index + 1} fan speed in % [{old_speed}]: ")
+        if speed_raw is None:
+            print("Cancelled. Nothing changed.")
+            time.sleep(1)
+            return
+        speed_raw = speed_raw.strip()
+        speed = old_speed if speed_raw == "" else _parse_int(speed_raw, fan_curve.MIN_SPEED, fan_curve.MAX_SPEED)
+        if speed is None:
+            print(f"Invalid speed (range {fan_curve.MIN_SPEED}-{fan_curve.MAX_SPEED}). Nothing changed.")
+            time.sleep(1)
+            return
+        updated.append((temp, speed))
+        previous_temp = temp
+
+    config.replace_points(device, updated)
+    _save_curve(config)
+
+
+def _show_curve_status(config):
+    cls()
+    state_text = "enabled" if config.enabled else "disabled"
+    print(f"Fan curve: {state_text}")
+    print(f"GPU idle: {config.gpu_idle_speed}% | fail-safe: {config.fail_safe_speed}% | "
+          f"hysteresis: {config.hysteresis_c} °C | min interval: {config.min_write_interval_s} s")
+    for device in fan_curve.DEVICES:
+        levels = " · ".join(f"{temp} °C->{speed}%" for temp, speed in config.points(device))
+        print(f"{device.upper()}: {levels}")
+
+    state = fan_curve.read_state()
+    if state:
+        age = fan_curve.state_age(state)
+        age_text = f"{age:.0f} s ago" if age is not None else "age unknown"
+        print(f"\nLast report ({state.get('source')}, {age_text}): {state.get('description') or '-'}")
+        print(f"Applied: {state.get('applied') or 'auto (firmware)'}")
+        if state.get("error"):
+            print(f"Error: {state['error']}")
+    else:
+        print("\nNo report yet: the background service (nitroctl-curve) has not run.")
+    ask("Press enter to continue.\n")
+
+
+def fan_curve_menu():
+    try:
+        config = fan_curve.load_config()
+    except fan_curve.CurveConfigError as exc:
+        print(f"ERROR: saved curve is invalid ({exc}); starting from defaults.")
+        time.sleep(2)
+        config = fan_curve.default_config()
+
+    while True:
+        cls()
+        print("Fan curve")
+        print(f"1: Turn the curve {'off' if config.enabled else 'on'} (currently {'on' if config.enabled else 'off'})")
+        print("2: Edit CPU levels")
+        print("3: Edit GPU levels")
+        print("4: Show status")
+        print("5: Apply once now (foreground test)")
+        print("6: Reset to defaults")
+        print("B: Back to main menu")
+        choice = ask("Type the number of your choice, then press enter.\n")
+        if choice is None:
+            return
+        choice = choice.strip().lower()
+
+        if choice == "b":
+            return
+        if choice == "1":
+            config.enabled = not config.enabled
+            _save_curve(config)
+        elif choice == "2":
+            _edit_curve_levels(config, "cpu")
+        elif choice == "3":
+            _edit_curve_levels(config, "gpu")
+        elif choice == "4":
+            _show_curve_status(config)
+        elif choice == "5":
+            cls()
+            engine = fan_curve.CurveEngine(config)
+            error = engine.tick()
+            outcome = engine.last_outcome
+            if outcome is not None:
+                print(outcome.describe())
+            if error:
+                print(f"ERROR: {error}")
+            elif engine.last_applied is None:
+                print("Nothing applied (value already in effect or minimum interval).")
+            fan_curve.write_state(outcome, engine.last_applied, error, source="cli")
+            time.sleep(2)
+        elif choice == "6":
+            config.curves = fan_curve.default_curves()
+            _save_curve(config)
+        else:
+            print("Unknown option. Returning to the curve menu.")
+            time.sleep(1)
+
+
 def mainloop():
     cls()
     print("Welcome to nitroctl!")
@@ -207,6 +354,7 @@ def mainloop():
     print("4: Fan Speed")
     print("5: LCD Overdrive")
     print("6: Keyboard RGB Configuration [UNIMPLEMENTED]")
+    print("7: Fan Curve")
     print("S: Save current configuration")
     print("L: Load configuration from default path [UNTESTED, MIGHT BREAK YOUR SYSTEM!]")
     print("Q: Quit program")
@@ -250,6 +398,8 @@ def run():
             cls()
             print("Keyboard RGB configuration is not implemented by the nitroctl project yet.")
             time.sleep(2)
+        elif next_function == "7":
+            fan_curve_menu()
         elif choice == "l":
             print(f"Loading previous configuration from {core.config_dir()}")
             try:

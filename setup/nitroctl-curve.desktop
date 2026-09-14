@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=nitroctl fan curve
+Comment=Applies the nitroctl fan curve in the background
+Exec=nitroctl-curve
+Icon=nitroctl
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

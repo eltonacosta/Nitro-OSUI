@@ -16,6 +16,7 @@
 #   --yes              responde "sim" a todas as perguntas (não-interativo)
 #   --no-deps          pula a instalação de dependências da base
 #   --no-gui           pula as dependências da GUI (só CLI)
+#   --no-autostart     não instala o autostart do daemon da curva
 #   --no-driver        pula a etapa DKMS/driver
 #   --driver-only      só executa a etapa DKMS/driver e sai
 #   --uninstall        remove nitroctl + driver e sai
@@ -45,6 +46,7 @@ TITLE="nitroctl"
 # ------------------------------------------------------------------ opções
 OPT_YES=0 OPT_NO_DEPS=0 OPT_NO_GUI=0 OPT_NO_DRIVER=0
 OPT_DRIVER_ONLY=0 OPT_UNINSTALL=0 OPT_DISTRO="" OPT_DRY_RUN=0 OPT_VERBOSE=0
+OPT_NO_AUTOSTART=0
 
 usage() {
     sed -n '2,/^set -u/p' "$0" | sed 's/^# \?//'
@@ -60,6 +62,7 @@ while [ $# -gt 0 ]; do
         --yes) OPT_YES=1 ;;
         --no-deps) OPT_NO_DEPS=1 ;;
         --no-gui) OPT_NO_GUI=1 ;;
+        --no-autostart) OPT_NO_AUTOSTART=1 ;;
         --no-driver) OPT_NO_DRIVER=1 ;;
         --driver-only) OPT_DRIVER_ONLY=1 ;;
         --uninstall) OPT_UNINSTALL=1 ;;
@@ -353,6 +356,28 @@ install_base() {
     install_packages "base" "$pkgs"
 }
 
+sync_tree_into() {
+    # Copia a árvore de $1 para $2, ignorando .git e caches do Python.
+    # O cp -r simples quebrava quando havia um __pycache__ de dono root
+    # (execução antiga com sudo) e abortava a instalação inteira.
+    local src_dir="$1" dst_dir="$2" archive
+    archive="$(mktemp)" || return 1
+    if command -v tar >/dev/null 2>&1; then
+        if ! tar -C "$src_dir" --exclude=.git --exclude=__pycache__ \
+                --exclude='*.pyc' -cf "$archive" . ; then
+            rm -f "$archive"
+            return 1
+        fi
+        if ! tar -C "$dst_dir" -xf "$archive" ; then
+            rm -f "$archive"
+            return 1
+        fi
+    else
+        cp -r "$src_dir/." "$dst_dir/" || { rm -f "$archive"; return 1; }
+    fi
+    rm -f "$archive"
+}
+
 install_nitroctl() {
     mkdir -p "$BIN_DIR"
     mkdir -p "$(dirname "$SRC_DIR")"
@@ -360,27 +385,30 @@ install_nitroctl() {
         printf '[dry-run] clonar/atualizar %s em %s; linkar nitroctl + nitroctl-gui em %s\n' "$REPO_URL" "$SRC_DIR" "$BIN_DIR" >&2
         return 0
     fi
-    if [ -d "$SRC_DIR/.git" ]; then
+    # A árvore que contém este install.sh é a fonte canônica (é dela que saem
+    # dkms.conf, service, regras): quando ela existe, sincroniza SEMPRE a partir
+    # dela. Um .git antigo em $SRC_DIR fazia o instalador tentar "git pull" e
+    # ficar desatualizado em relação à árvore local.
+    if [ -d "$REPO_DIR/setup" ] && [ "$REPO_DIR" != "$SRC_DIR" ] && [ -d "$SRC_DIR" ]; then
+        msg "$SRC_DIR já existe; sincronizando com a árvore atual."
+        sync_tree_into "$REPO_DIR" "$SRC_DIR" || {
+            err "Não foi possível sincronizar $SRC_DIR."
+            return 1
+        }
+        rm -rf "$SRC_DIR/.git" 2>/dev/null || true
+    elif [ -d "$SRC_DIR" ] && [ -n "$(ls -A "$SRC_DIR" 2>/dev/null)" ]; then
+        # Sem árvore de origem (instalador avulso): atualiza o clone existente.
         msg "O nitroctl já está em $SRC_DIR; atualizando com git pull."
         git -C "$SRC_DIR" pull --ff-only || { err "Não foi possível atualizar o repositório em $SRC_DIR."; return 1; }
-    elif [ -d "$SRC_DIR" ] && [ -n "$(ls -A "$SRC_DIR" 2>/dev/null)" ]; then
-        # Diretório de uma instalação anterior (clone do upstream ou cópia):
-        # sincroniza com a árvore que contém este install.sh, que é a fonte
-        # canônica dos arquivos que as etapas seguintes (dkms.conf, service)
-        # esperam encontrar em $SRC_DIR.
-        msg "$SRC_DIR já existe; sincronizando com a árvore atual."
-        if [ -d "$REPO_DIR/setup" ] && [ "$REPO_DIR" != "$SRC_DIR" ]; then
-            cp -r "$REPO_DIR/." "$SRC_DIR/" || { err "Não foi possível sincronizar $SRC_DIR."; return 1; }
-            rm -rf "$SRC_DIR/.git"
-        fi
     else
         git clone "$REPO_URL" "$SRC_DIR" || { err "Não foi possível baixar o nitroctl. Verifique a conexão e tente de novo."; return 1; }
     fi
-    for script in nitroctl.sh nitroctl-gui.sh; do
+    for script in nitroctl.sh nitroctl-gui.sh nitroctl-curve.sh; do
         [ -f "$SRC_DIR/$script" ] && chmod +x "$SRC_DIR/$script"
     done
     ln -sf "$SRC_DIR/nitroctl.sh" "$BIN_DIR/nitroctl"
     ln -sf "$SRC_DIR/nitroctl-gui.sh" "$BIN_DIR/nitroctl-gui"
+    ln -sf "$SRC_DIR/nitroctl-curve.sh" "$BIN_DIR/nitroctl-curve"
 
     # Entrada no menu de aplicativos + ícone (modo gráfico).
     # O Exec usa caminho absoluto: ~/.local/bin pode não estar no PATH que
@@ -399,7 +427,32 @@ install_nitroctl() {
     if command -v gtk-update-icon-cache >/dev/null 2>&1; then
         gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
     fi
-    msg "nitroctl instalado em $SRC_DIR, com os comandos 'nitroctl' e 'nitroctl-gui' em $BIN_DIR e entrada no menu de aplicativos."
+    msg "nitroctl instalado em $SRC_DIR, com os comandos 'nitroctl', 'nitroctl-gui' e 'nitroctl-curve' em $BIN_DIR e entrada no menu de aplicativos."
+}
+
+# ------------------------------------------------- autostart da curva
+# A curva roda num daemon leve (nitroctl-curve) iniciado junto com a sessão,
+# para continuar valendo com a GUI fechada. Usa o autostart do padrão
+# freedesktop (~/.config/autostart), respeitado por GNOME, KDE, Xfce, Sway e
+# afins sem depender de systemd.
+install_curve_autostart() {
+    if [ "$OPT_NO_AUTOSTART" -eq 1 ]; then
+        log "autostart da curva pulado (--no-autostart)"
+        return 0
+    fi
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+        printf '[dry-run] escrever %s (daemon da curva)\n' "$HOME/.config/autostart/nitroctl-curve.desktop" >&2
+        return 0
+    fi
+    if [ ! -f "$SCRIPT_SELF_DIR/nitroctl-curve.desktop" ]; then
+        log "setup/nitroctl-curve.desktop ausente; autostart não instalado"
+        return 0
+    fi
+    mkdir -p "$HOME/.config/autostart"
+    sed "s|^Exec=nitroctl-curve|Exec=$BIN_DIR/nitroctl-curve|" \
+        "$SCRIPT_SELF_DIR/nitroctl-curve.desktop" \
+        > "$HOME/.config/autostart/nitroctl-curve.desktop"
+    log "autostart da curva instalado"
 }
 
 install_gui_deps() {
@@ -555,6 +608,34 @@ PYEOF
 # A senha é pedida UMA vez aqui na instalação. Sem udev (containers,
 # sistemas mínimos) a GUI mantém o comportamento antigo: eleva via
 # pkexec/sudo a cada uso.
+# Home do usuário real (o $HOME vira /root quando o instalador roda com sudo).
+real_home() {
+    local user="$1" home=""
+    if [ -n "$user" ] && [ "$user" != "root" ]; then
+        home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6)"
+    fi
+    [ -n "$home" ] || home="$HOME"
+    printf '%s' "$home"
+}
+
+# Instalações antigas criaram ~/.config/nitroctl (e o cache) como root: sem
+# isto a GUI rodando como usuário não consegue mais gravar a curva nem salvar
+# configuração. Devolve ao usuário real quando o instalador roda elevado.
+fix_config_ownership() {
+    local user="$1" home
+    home="$(real_home "$user")"
+    [ -n "$user" ] && [ "$user" != "root" ] || return 0
+    local dir
+    for dir in "$home/.config/nitroctl" "$home/.cache/nitroctl"; do
+        [ -d "$dir" ] || continue
+        if [ -n "$(find "$dir" ! -user "$user" -print -quit 2>/dev/null)" ]; then
+            if run_root chown -R "$user" "$dir"; then
+                msg "Corrigido o dono de $dir (estava como root, de instalação antiga)."
+            fi
+        fi
+    done
+}
+
 install_passwordless() {
     if ! command -v udevadm >/dev/null 2>&1 || [ ! -d /etc/udev/rules.d ]; then
         msg "AVISO: udev não encontrado; acesso sem senha indisponível.
@@ -610,6 +691,7 @@ A GUI vai continuar pedindo senha (pkexec/sudo) a cada abertura."
     run_root udevadm trigger --subsystem-match=platform --attr-match=driver=acer-wmi 2>/dev/null || true
 
     cleanup_legacy_passwordless
+    fix_config_ownership "${real_user:-}"
     if [ -n "${real_user:-}" ] && [ "$real_user" != "root" ]; then
         msg "Acesso sem senha ativado para $real_user: 'nitroctl-gui' abre direto.
 O grupo nitroctl também foi configurado para outros usuários (após relogin)."
@@ -656,7 +738,9 @@ uninstall_all() {
     fi
     run_root modprobe acer_wmi 2>/dev/null || true
     rm -f "$BIN_DIR/nitroctl" "$BIN_DIR/nitroctl-gui" "$BIN_DIR/nitroctl-gui-root"
+    rm -f "$BIN_DIR/nitroctl-curve"
     rm -f "$HOME/.local/share/applications/nitroctl.desktop"
+    rm -f "$HOME/.config/autostart/nitroctl-curve.desktop"
     rm -f "$HOME/.local/share/icons/hicolor/scalable/apps/nitroctl.svg"
     if command -v update-desktop-database >/dev/null 2>&1; then
         update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
@@ -714,6 +798,7 @@ O programa será baixado da internet ($REPO_URL)."; then
         exit 1
     fi
     install_nitroctl || exit 1
+    install_curve_autostart
     gui_status=0; install_gui_deps || gui_status=$?
     driver_status=0; install_driver_dkms || driver_status=$?
     check_path
@@ -727,7 +812,9 @@ O programa será baixado da internet ($REPO_URL)."; then
     msg "Instalação concluída.
 
 Linha de comando:  nitroctl
-Interface gráfica: nitroctl-gui (janela GTK4 nativa, sem senha)"
+Interface gráfica: nitroctl-gui (janela GTK4 nativa, sem senha)
+Curva de ventoinha: configurável na GUI (item 7 do CLI); aplicada em
+segundo plano por 'nitroctl-curve' (autostart da sessão)"
 }
 
 main "$@"

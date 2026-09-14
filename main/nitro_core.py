@@ -318,6 +318,53 @@ def user_home() -> Path:
     return Path.home()
 
 
+def real_user_name() -> str:
+    """Nome do usuário real por trás da elevação (SUDO_USER/PKEXEC_UID)."""
+    name = os.environ.get("SUDO_USER")
+    if not name and os.environ.get("PKEXEC_UID"):
+        try:
+            name = pwd.getpwuid(int(os.environ["PKEXEC_UID"])).pw_name
+        except (KeyError, ValueError):
+            name = ""
+    if not name:
+        # Sem elevação: o "usuário real" é quem está rodando agora mesmo.
+        try:
+            name = pwd.getpwuid(os.geteuid()).pw_name
+        except KeyError:
+            name = ""
+    return name or ""
+
+
+def adopt_ownership(target: Path, top: Optional[Path] = None) -> None:
+    """Rodando como root, devolve `target` (e os pais até `top`) ao usuário real.
+
+    Instalações antigas criaram ~/.config/nitroctl como root; sem isto, a GUI
+    rodando como usuário não consegue mais gravar ali.
+    """
+    if not is_root():
+        return
+    name = real_user_name()
+    if not name or name == "root":
+        return
+    try:
+        entry = pwd.getpwnam(name)
+    except KeyError:
+        return
+    targets = [target]
+    if top is not None:
+        current = target if target.is_dir() else target.parent
+        while True:
+            targets.append(current)
+            if current == top or current.parent == current:
+                break
+            current = current.parent
+    for item in dict.fromkeys(targets):
+        try:
+            os.chown(item, entry.pw_uid, entry.pw_gid)
+        except OSError:
+            pass
+
+
 def config_dir() -> Path:
     return user_home() / ".config" / "nitroctl"
 
@@ -328,7 +375,14 @@ def save_config() -> tuple[list[str], list[tuple[str, str]]]:
     Devolve (salvos, pulados), em que pulados são pares (nome, motivo).
     """
     target_dir = config_dir()
-    target_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except PermissionError as exc:
+        raise PermissionError(
+            f"sem permissão para criar {target_dir} ({exc}). "
+            f"Corrija o dono uma vez: sudo chown -R "
+            f"{real_user_name() or '$USER'} {config_dir()}"
+        ) from exc
     saved: list[str] = []
     skipped: list[tuple[str, str]] = []
     for item in sorted(sense_dir().iterdir()):
@@ -339,6 +393,7 @@ def save_config() -> tuple[list[str], list[tuple[str, str]]]:
             saved.append(item.name)
         except OSError as exc:
             skipped.append((item.name, str(exc)))
+    adopt_ownership(target_dir, config_dir())
     return saved, skipped
 
 

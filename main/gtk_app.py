@@ -23,6 +23,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
+import fan_curve  # noqa: E402
 import nitro_core as core
 
 APP_ID = "io.github.cani442k.nitroctl"
@@ -43,6 +44,20 @@ class NitroWindow(Adw.ApplicationWindow):
         # Habilita escrita quando dá para controlar sem senha (root ou
         # grupo nitroctl com a regra udev); só pede elevação caso contrário.
         self.can_write = core.can_control()
+
+        # Curva de ventoinha: mesma configuração lida pelo daemon (fan_curve.py).
+        try:
+            self.curve_config = fan_curve.load_config()
+            self.curve_config_error = None
+        except fan_curve.CurveConfigError as exc:
+            self.curve_config = fan_curve.default_config()
+            self.curve_config_error = str(exc)
+        self.curve_rows = {}
+        self._curve_updating = False
+        self._curve_lock = None
+        self._curve_engine = None
+        self._curve_toggling = False
+        self._driver_available = bool(core.driver_base())
 
         # Adw.ApplicationWindow não aceita set_titlebar: o header vai dentro
         # de um Adw.ToolbarView, que é o content da janela.
@@ -88,6 +103,9 @@ class NitroWindow(Adw.ApplicationWindow):
         self.fan_group = self._build_fan_group()
         page.append(self.fan_group)
 
+        self.curve_group = self._build_curve_group()
+        page.append(self.curve_group)
+
         self.toggle_group = self._build_toggle_group()
         page.append(self.toggle_group)
 
@@ -105,6 +123,11 @@ class NitroWindow(Adw.ApplicationWindow):
         # rótulos de leitura — nunca nos controles, para não brigar com
         # o usuário no meio de um ajuste.
         GLib.timeout_add(core.SENSOR_POLL_MS, self._poll_sensors)
+        # A curva tem laço próprio: só escreve quando esta janela é a
+        # aplicadora (sem daemon rodando); caso contrário apenas exibe o
+        # estado publicado pelo daemon.
+        GLib.timeout_add(fan_curve.TICK_SECONDS * 1000, self._curve_tick)
+        self.connect("close-request", self._on_close_request)
 
     # ------------------------------------------------------------ construção
     def _locked_note(self, row: Adw.ActionRow, attr: str) -> None:
@@ -154,6 +177,7 @@ class NitroWindow(Adw.ApplicationWindow):
         apply_button.add_css_class("suggested-action")
         apply_button.set_sensitive(self.can_write)
         apply_button.connect("clicked", self._on_apply_fan_speed)
+        self.apply_button = apply_button
         # O botão de ação fica fora do cartão, com respiro acima.
         apply_button.set_margin_top(12)
         page_button_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -173,6 +197,63 @@ class NitroWindow(Adw.ApplicationWindow):
             row.set_subtitle("n/a")
             group.add(row)
             self.sensor_rows[key] = row
+        return group
+
+    def _build_curve_group(self) -> Adw.PreferencesGroup:
+        group = Adw.PreferencesGroup()
+        group.set_title("Fan curve")
+        group.set_description(
+            "7 levels per fan, never below 20%. Applied in the background by "
+            "'nitroctl-curve'; edits here take effect immediately. The quiet/low-power "
+            "profile resets the fans to auto, and the curve reapplies within seconds."
+        )
+
+        self.curve_switch = Adw.SwitchRow()
+        self.curve_switch.set_title("Enable fan curve")
+        self.curve_switch.set_subtitle("Overrides the manual fan speeds while on.")
+        self.curve_switch.set_active(self.curve_config.enabled)
+        self.curve_switch.set_sensitive(self.can_write and core.supports("fan_speed"))
+        self.curve_switch.connect("notify::active", self._on_curve_toggled)
+        group.add(self.curve_switch)
+
+        self.curve_status_row = Adw.ActionRow()
+        self.curve_status_row.set_title("Status")
+        self.curve_status_row.set_subtitle("Curve disabled — firmware controls the fans.")
+        group.add(self.curve_status_row)
+
+        for device in fan_curve.DEVICES:
+            expander = Adw.ExpanderRow()
+            expander.set_title(f"{device.upper()} curve")
+            expander.set_subtitle("7 levels · temperature and speed")
+            expander.set_sensitive(self.can_write)
+            spins = []
+            for index in range(fan_curve.LEVELS):
+                row = Adw.ActionRow()
+                row.set_title(f"Level {index + 1}")
+                temp_spin = Gtk.SpinButton.new_with_range(fan_curve.MIN_TEMP, fan_curve.MAX_TEMP, 1)
+                temp_spin.set_tooltip_text("Temperature threshold (°C)")
+                speed_spin = Gtk.SpinButton.new_with_range(fan_curve.MIN_SPEED, fan_curve.MAX_SPEED, 5)
+                speed_spin.set_tooltip_text("Fan speed (%), minimum 20")
+                box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                box.append(temp_spin)
+                box.append(Gtk.Label(label="°C"))
+                box.append(speed_spin)
+                box.append(Gtk.Label(label="%"))
+                row.add_suffix(box)
+                temp_spin.connect("value-changed", self._on_curve_edited, device)
+                speed_spin.connect("value-changed", self._on_curve_edited, device)
+                expander.add_row(row)
+                spins.append((temp_spin, speed_spin))
+            self.curve_rows[device] = spins
+            group.add(expander)
+
+        reset = Gtk.Button.new_with_label("Reset to defaults")
+        reset.set_sensitive(self.can_write)
+        reset.connect("clicked", self._on_curve_reset)
+        reset.set_margin_top(12)
+        reset_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        reset_box.append(reset)
+        group.add(reset_box)
         return group
 
     def _build_toggle_group(self) -> Adw.PreferencesGroup:
@@ -273,14 +354,180 @@ class NitroWindow(Adw.ApplicationWindow):
             f"{interface}\nKeyboard RGB: not implemented by the upstream project."
         )
         self._poll_sensors()
+        self._refresh_curve_rows()
+        self._update_fan_locks()
+        self._update_curve_status()
 
     def _poll_sensors(self) -> bool:
         """Atualiza só os rótulos do cartão Sensors; roda via GLib.timeout_add."""
-        for reading in core.sensor_readings():
+        readings = core.sensor_readings()
+        for reading in readings:
             row = self.sensor_rows.get(reading.key)
             if row is not None:
                 row.set_subtitle(reading.text)
+        # O driver pode reaparecer depois do boot (carga do módulo, troca de
+        # kernel): sem isto o rodapé ficaria dizendo "não encontrado" para sempre.
+        available = bool(core.driver_base())
+        if available != self._driver_available:
+            self._driver_available = available
+            self.refresh()
         return True
+
+    # ------------------------------------------------------------------ curva
+    def _save_curve_config(self) -> bool:
+        try:
+            fan_curve.save_config(self.curve_config)
+        except (fan_curve.CurveConfigError, OSError) as exc:
+            self.notify(f"Could not save the fan curve: {exc}", error=True)
+            return False
+        if self._curve_engine is not None:
+            self._curve_engine.config = self.curve_config
+        return True
+
+    def _refresh_curve_rows(self) -> None:
+        """Traz os widgets de volta ao que está salvo (sem disparar handlers)."""
+        self._curve_updating = True
+        try:
+            for device, spins in self.curve_rows.items():
+                points = self.curve_config.points(device)
+                for (temp_spin, speed_spin), (temp, speed) in zip(spins, points):
+                    temp_spin.set_value(temp)
+                    speed_spin.set_value(speed)
+            self.curve_switch.handler_block_by_func(self._on_curve_toggled)
+            self.curve_switch.set_active(self.curve_config.enabled)
+            self.curve_switch.handler_unblock_by_func(self._on_curve_toggled)
+        finally:
+            self._curve_updating = False
+
+    def _update_fan_locks(self) -> None:
+        """Com a curva ligada, os controles manuais saem de cena (com aviso)."""
+        curve_on = self.curve_config.enabled
+        for device, (auto_row, speed_row) in self.fan_rows.items():
+            auto_row.set_sensitive(self.can_write and not curve_on)
+            speed_row.set_sensitive(self.can_write and not curve_on and not auto_row.get_active())
+            if curve_on:
+                auto_row.set_subtitle("Fan curve is active — turn it off to control this fan by hand.")
+            else:
+                auto_row.set_subtitle("Auto hands control back to the firmware.")
+        self.apply_button.set_sensitive(self.can_write and not curve_on)
+
+    def _update_curve_status(self) -> None:
+        if not self.curve_config.enabled:
+            self.curve_status_row.set_subtitle("Curve disabled — firmware controls the fans.")
+            return
+        if not core.supports("fan_speed"):
+            self.curve_status_row.set_subtitle("This device does not expose 'fan_speed'.")
+            return
+        state = fan_curve.read_state() or {}
+        age = fan_curve.state_age(state)
+        if self._curve_engine is not None:
+            who = "applied by this window"
+        elif age is not None and age < fan_curve.TICK_SECONDS * 5:
+            who = "applied by the background service"
+        else:
+            who = "not running — start 'nitroctl-curve' or keep this window open"
+        details = state.get("error") or state.get("description") or "no reading yet"
+        self.curve_status_row.set_subtitle(f"{details} — {who}")
+
+    def _on_curve_edited(self, _spin: Gtk.SpinButton, device: str) -> None:
+        if self._curve_updating:
+            return
+        points = [(int(temp.get_value()), int(speed.get_value()))
+                  for temp, speed in self.curve_rows[device]]
+        temps = [temp for temp, _ in points]
+        if any(temps[index] <= temps[index - 1] for index in range(1, len(temps))):
+            self.notify("Temperatures must be strictly increasing.", error=True)
+            self._refresh_curve_rows()
+            return
+        previous = self.curve_config.points(device)
+        self.curve_config.replace_points(device, points)
+        if not self._save_curve_config():
+            self.curve_config.replace_points(device, previous)
+            self._refresh_curve_rows()
+            self._update_curve_status()
+            return
+        self._update_curve_status()
+
+    def _on_curve_reset(self, _button: Gtk.Button) -> None:
+        self.curve_config.curves = fan_curve.default_curves()
+        if self._save_curve_config():
+            self._refresh_curve_rows()
+            self.notify("Fan curve reset to defaults.")
+
+    def _on_curve_toggled(self, row: Adw.SwitchRow, _param: object) -> None:
+        # O Adw.SwitchRow avisa duas vezes por mudança (binding interno do
+        # GtkSwitch + a propriedade da linha); sem esta guarda o salvamento e
+        # o toast aconteceriam em dobro.
+        if self._curve_updating or self._curve_toggling:
+            return
+        self._curve_toggling = True
+        try:
+            self._apply_curve_toggle(row)
+        finally:
+            self._curve_toggling = False
+
+    def _apply_curve_toggle(self, row: Adw.SwitchRow) -> None:
+        # A segunda notificação (espúria) traz o mesmo estado que já está em
+        # memória: ignorar evita salvar e avisar duas vezes.
+        if row.get_active() == self.curve_config.enabled:
+            return
+        previous = self.curve_config.enabled
+        self.curve_config.enabled = row.get_active()
+        if not self._save_curve_config():
+            # Não deu para persistir: desfaz também em memória e devolve o
+            # switch ao que está salvo, para a janela não mostrar um estado
+            # que o daemon não conhece.
+            self.curve_config.enabled = previous
+            self._refresh_curve_rows()
+            self._update_fan_locks()
+            self._update_curve_status()
+            return
+        if not self.curve_config.enabled:
+            if self._curve_engine is not None:
+                self._curve_engine.restore_auto()
+                self._curve_engine = None
+            self._release_curve_lock()
+            self.notify("Fan curve disabled; firmware control restored.")
+        elif not self.can_write:
+            self.notify("Curve saved, but this window cannot apply it (read-only).", error=True)
+        else:
+            self.notify("Fan curve enabled.")
+        # Relê o driver: com a curva desligada isto mostra o automático de volta;
+        # ligada, mostra os valores que a curva acabou de assumir.
+        self.refresh()
+
+    def _curve_tick(self) -> bool:
+        """Aplica a curva quando esta janela é a aplicadora; senão só exibe."""
+        if (self.can_write and self.curve_config.enabled
+                and self._curve_lock is None and self._curve_engine is None):
+            lock = fan_curve.CurveLock()
+            if lock.acquire():
+                self._curve_lock = lock
+                self._curve_engine = fan_curve.CurveEngine(self.curve_config)
+        if self._curve_engine is not None:
+            if self.curve_config.enabled:
+                error = self._curve_engine.tick()
+                fan_curve.write_state(self._curve_engine.last_outcome,
+                                      self._curve_engine.last_applied, error, source="gui")
+            else:
+                self._curve_engine.restore_auto()
+                self._curve_engine = None
+                self._release_curve_lock()
+        self._update_curve_status()
+        return True
+
+    def _release_curve_lock(self) -> None:
+        if self._curve_lock is not None:
+            self._curve_lock.release()
+            self._curve_lock = None
+
+    def _on_close_request(self, _window: Gtk.Window) -> bool:
+        # Fechar a janela não pode deixar as ventoinhas presas num valor fixo
+        # quando é esta janela que aplica a curva (daemon ausente).
+        if self._curve_engine is not None and self.curve_config.enabled:
+            self._curve_engine.restore_auto()
+        self._release_curve_lock()
+        return False
 
     # ----------------------------------------------------------------- ações
     def notify(self, message: str, error: bool = False) -> None:
