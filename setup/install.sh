@@ -32,7 +32,11 @@ set -u
 VERSION="2.0.0"
 REPO_URL="https://github.com/eltonacosta/nitroctl.git"
 DRIVER_URL="https://github.com/0x7375646F/Linuwu-Sense.git"
-SRC_DIR="$HOME/.local/share/nitroctl"
+# Raiz dos arquivos do nitroctl. Deriva do local deste script (não de $HOME):
+# rodar via sudo muda $HOME para /root e quebraria todos os caminhos setup/.
+SCRIPT_SELF_DIR="$(dirname "$(readlink -f "$0")")"
+REPO_DIR="$(dirname "$SCRIPT_SELF_DIR")"
+SRC_DIR="${NITROCTL_SRC:-$HOME/.local/share/nitroctl}"
 BIN_DIR="$HOME/.local/bin"
 DKMS_NAME="linuwu_sense"
 DKMS_VERSION="1.0"
@@ -116,7 +120,7 @@ ask_yn() {
 # Carrega setup/distros.conf e resolve o perfil: --distro > ID > ID_LIKE > pm.
 DISTRO_FILE=""
 find_distros_conf() {
-    for candidate in "$SRC_DIR/setup/distros.conf" "$(dirname "$(readlink -f "$0")")/distros.conf"; do
+    for candidate in "$SCRIPT_SELF_DIR/distros.conf" "$SRC_DIR/setup/distros.conf"; do
         if [ -f "$candidate" ]; then DISTRO_FILE="$candidate"; return 0; fi
     done
     return 1
@@ -200,14 +204,16 @@ INSTALL_CMD=""
 SUDO="sudo"
 
 build_install_cmd() {
+    # INSTALL_CMD precisa usar o mesmo elevador de SUDO: em sistemas
+    # sem sudo (ex.: Alpine com doas) o comando literal "sudo ..." falhava.
     case "$P_PM" in
-        pacman) INSTALL_CMD="sudo pacman -S --noconfirm --needed" ;;
-        apt) INSTALL_CMD="sudo apt install -y" ;;
-        dnf) INSTALL_CMD="sudo dnf install -y" ;;
-        zypper) INSTALL_CMD="sudo zypper install -y" ;;
-        xbps) INSTALL_CMD="sudo xbps-install -S -y" ;;
-        apk) INSTALL_CMD="sudo apk add" ;;
-        emerge) INSTALL_CMD="sudo emerge --ask=n" ;;
+        pacman) INSTALL_CMD="pacman -S --noconfirm --needed" ;;
+        apt) INSTALL_CMD="apt install -y" ;;
+        dnf) INSTALL_CMD="dnf install -y" ;;
+        zypper) INSTALL_CMD="zypper install -y" ;;
+        xbps) INSTALL_CMD="xbps-install -S -y" ;;
+        apk) INSTALL_CMD="apk add" ;;
+        emerge) INSTALL_CMD="emerge --ask=n" ;;
         *) INSTALL_CMD="" ;;
     esac
     case "$P_SUDO" in
@@ -222,16 +228,32 @@ build_install_cmd() {
 }
 
 run_root() {
-    # Executa comando com privilégio (respeita --dry-run).
+    # Executa comando com privilégio (respeita --dry-run). O elevador
+    # "su -c" recebe o comando como uma string só, não como argv.
     if [ "$OPT_DRY_RUN" -eq 1 ]; then printf '[dry-run] %s %s\n' "$SUDO" "$*" >&2; return 0; fi
-    if [ "$(id -u)" -eq 0 ]; then "$@"; else $SUDO "$@"; fi
+    if [ "$(id -u)" -eq 0 ]; then "$@"; return "$?"; fi
+    case "$SUDO" in
+        "su -c") su -c "$*" ;;
+        *) $SUDO "$@" ;;
+    esac
 }
 
 run_install() {
     # Instala pacotes via gerenciador (respeita --dry-run).
-    if [ "$OPT_DRY_RUN" -eq 1 ]; then printf '[dry-run] %s %s\n' "$INSTALL_CMD" "$*" >&2; return 0; fi
-    # shellcheck disable=SC2086
-    $INSTALL_CMD "$@" || return 1
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then printf '[dry-run] %s %s %s\n' "$SUDO" "$INSTALL_CMD" "$*" >&2; return 0; fi
+    if [ -z "$INSTALL_CMD" ]; then err "Sem gerenciador de pacotes; instale manualmente e rode com --no-deps."; return 1; fi
+    if [ "$(id -u)" -eq 0 ]; then
+        # shellcheck disable=SC2086
+        $INSTALL_CMD "$@" || return 1
+        return 0
+    fi
+    case "$SUDO" in
+        "su -c")
+            su -c "$INSTALL_CMD $*" || return 1 ;;
+        *)
+            # shellcheck disable=SC2086
+            $SUDO $INSTALL_CMD "$@" || return 1 ;;
+    esac
 }
 
 need_pkgs() {
@@ -306,7 +328,7 @@ Nenhum gerenciador suportado. Instale manualmente e rode com --no-deps."
     fi
     if ask_yn "Instalar dependências ($label):$missing
 
-Comando: $INSTALL_CMD$missing"; then
+Comando: $SUDO $INSTALL_CMD$missing"; then
         # shellcheck disable=SC2086
         run_install $missing || { err "A instalação de ($label) falhou."; return 1; }
     else
@@ -347,10 +369,8 @@ install_nitroctl() {
         # canônica dos arquivos que as etapas seguintes (dkms.conf, service)
         # esperam encontrar em $SRC_DIR.
         msg "$SRC_DIR já existe; sincronizando com a árvore atual."
-        local self_dir
-        self_dir="$(dirname "$(readlink -f "$0")")/.."
-        if [ -d "$self_dir/setup" ] && [ "$self_dir" != "$SRC_DIR" ]; then
-            cp -r "$self_dir/." "$SRC_DIR/" || { err "Não foi possível sincronizar $SRC_DIR."; return 1; }
+        if [ -d "$REPO_DIR/setup" ] && [ "$REPO_DIR" != "$SRC_DIR" ]; then
+            cp -r "$REPO_DIR/." "$SRC_DIR/" || { err "Não foi possível sincronizar $SRC_DIR."; return 1; }
             rm -rf "$SRC_DIR/.git"
         fi
     else
@@ -366,12 +386,12 @@ install_nitroctl() {
     # O Exec usa caminho absoluto: ~/.local/bin pode não estar no PATH que
     # o lançador gráfico enxerga (comum em Debian/Ubuntu, Fedora, openSUSE).
     mkdir -p "$HOME/.local/share/applications" "$HOME/.local/share/icons/hicolor/scalable/apps"
-    if [ -f "$SRC_DIR/setup/nitroctl.desktop" ]; then
+    if [ -f "$SCRIPT_SELF_DIR/nitroctl.desktop" ]; then
         sed "s|^Exec=nitroctl-gui|Exec=$BIN_DIR/nitroctl-gui|" \
-            "$SRC_DIR/setup/nitroctl.desktop" > "$HOME/.local/share/applications/nitroctl.desktop"
+            "$SCRIPT_SELF_DIR/nitroctl.desktop" > "$HOME/.local/share/applications/nitroctl.desktop"
     fi
-    if [ -f "$SRC_DIR/setup/nitroctl.svg" ]; then
-        cp "$SRC_DIR/setup/nitroctl.svg" "$HOME/.local/share/icons/hicolor/scalable/apps/nitroctl.svg"
+    if [ -f "$SCRIPT_SELF_DIR/nitroctl.svg" ]; then
+        cp "$SCRIPT_SELF_DIR/nitroctl.svg" "$HOME/.local/share/icons/hicolor/scalable/apps/nitroctl.svg"
     fi
     if command -v update-desktop-database >/dev/null 2>&1; then
         update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
@@ -423,6 +443,21 @@ install_driver_dkms() {
     }
 
     if grep -q "strncpy" "$workdir/Linuwu-Sense/src/linuwu_sense.c"; then
+        # Kernels Clang (CachyOS e afins) rejeitam strncpy implícito; o
+        # memcpy com guarda de len==0 é o equivalente seguro aqui.
+        # O patch só faz sentido com toolchain Clang instalada.
+        if ! command -v clang >/dev/null 2>&1; then
+            if [ -n "$P_LLVM" ] && [ -n "$INSTALL_CMD" ]; then
+                install_packages "toolchain Clang (patch do driver)" "$P_LLVM" || {
+                    rm -rf "$workdir"
+                    return 1
+                }
+            else
+                rm -rf "$workdir"
+                err "O driver precisa do Clang para compilar neste kernel (CONFIG_CC_IS_CLANG=y), mas clang não está instalado e o perfil '$P_ID' não informa a toolchain. Instale o Clang manualmente e rode com --driver-only."
+                return 1
+            fi
+        fi
         python3 - "$workdir/Linuwu-Sense/src/linuwu_sense.c" <<'PYEOF' || {
 import sys
 path = sys.argv[1]
@@ -440,7 +475,7 @@ PYEOF
         }
     fi
 
-    cp "$SRC_DIR/setup/dkms.conf" "$workdir/Linuwu-Sense/dkms.conf" || {
+    cp "$SCRIPT_SELF_DIR/dkms.conf" "$workdir/Linuwu-Sense/dkms.conf" || {
         rm -rf "$workdir"
         err "setup/dkms.conf não encontrado no nitroctl baixado."
         return 1
@@ -459,6 +494,18 @@ PYEOF
         [ -d "$kdir" ] && run_root rm -f "${kdir}kernel/drivers/platform/x86/linuwu_sense.ko" 2>/dev/null
     done
 
+    # Reinstalação limpa: se a mesma versão já está registrada (instalação
+    # anterior ou tentativa interrompida no meio), remove o registro antes
+    # do add — sem isso o dkms aborta com "DKMS tree already contains" e
+    # o --driver-only nunca consegue atualizar nem terminar o resto
+    # (serviço, regra udev sem senha).
+    if dkms status -m "$DKMS_NAME" -v "$DKMS_VERSION" 2>/dev/null | grep -q "$DKMS_NAME"; then
+        log "árvore DKMS existente; removendo para atualizar"
+        run_root dkms remove -m "$DKMS_NAME" -v "$DKMS_VERSION" --all || {
+            err "Não foi possível remover a árvore DKMS existente. Veja 'dkms status'."
+            return 1
+        }
+    fi
     run_root dkms add -m "$DKMS_NAME" -v "$DKMS_VERSION" || {
         err "O dkms não aceitou o módulo. Veja 'dkms status'."
         return 1
@@ -470,15 +517,118 @@ PYEOF
 
     # Serviço + blacklist (vêm do repo, não do Linuwu-Sense): garantem que o
     # módulo DKMS carregue no boot e que o acer_wmi continue bloqueado.
-    run_root cp "$SRC_DIR/setup/linuwu_sense.service" /etc/systemd/system/linuwu_sense.service
-    run_root cp "$SRC_DIR/setup/blacklist-acer_wmi.conf" /etc/modprobe.d/blacklist-acer_wmi.conf
-    run_root systemctl daemon-reload
-    run_root systemctl enable linuwu_sense.service
-    if ! run_root systemctl restart linuwu_sense.service; then
-        err "O serviço não subiu com o módulo DKMS. Veja 'systemctl status linuwu_sense.service'."
-        return 1
+    # Em sistemas sem systemd (Alpine/OpenRC, containers) o modprobe direto
+    # substitui o serviço em vez de falhar.
+    run_root cp "$SCRIPT_SELF_DIR/linuwu_sense.service" /etc/systemd/system/linuwu_sense.service
+    run_root cp "$SCRIPT_SELF_DIR/blacklist-acer_wmi.conf" /etc/modprobe.d/blacklist-acer_wmi.conf
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        run_root systemctl daemon-reload
+        run_root systemctl enable linuwu_sense.service
+        if ! run_root systemctl restart linuwu_sense.service; then
+            err "O serviço não subiu com o módulo DKMS. Veja 'systemctl status linuwu_sense.service'."
+            return 1
+        fi
+    else
+        if ! run_root modprobe -r acer_wmi 2>/dev/null; then
+            log "acer_wmi não estava carregado (ok)"
+        fi
+        if ! run_root modprobe linuwu_sense; then
+            err "O módulo compilou mas não carregou (modprobe linuwu_sense falhou). Sem systemd, carregue-o no boot via /etc/modules ou modprobe manual."
+            return 1
+        fi
+        msg "Sem systemd detectado: módulo carregado via modprobe. Para carregar no boot, adicione 'linuwu_sense' em /etc/modules (ou equivalente)."
     fi
     msg "Driver registrado no DKMS e serviço ativado: o módulo recompila sozinho a cada kernel e carrega no boot."
+    install_passwordless || return 1
+}
+
+# ------------------------------------------------- acesso sem senha (udev)
+# A escrita no sysfs exige root, e pedir senha a cada abertura da GUI é
+# ruim. A solução: uma regra udev dá a POSSE dos nós do driver ao usuário
+# real (setup/99-nitroctl.rules), além do grupo nitroctl.
+#
+# Posse vale imediatamente (permissão de dono é checada por uid), sem
+# relogin — diferente do grupo, que só entra em login novo. O udev
+# reaplica a posse a cada carga do módulo: boot, atualização de kernel
+# (via DKMS) e modprobe manual.
+#
+# A senha é pedida UMA vez aqui na instalação. Sem udev (containers,
+# sistemas mínimos) a GUI mantém o comportamento antigo: eleva via
+# pkexec/sudo a cada uso.
+install_passwordless() {
+    if ! command -v udevadm >/dev/null 2>&1 || [ ! -d /etc/udev/rules.d ]; then
+        msg "AVISO: udev não encontrado; acesso sem senha indisponível.
+A GUI vai continuar pedindo senha (pkexec/sudo) a cada abertura."
+        return 0
+    fi
+    if ! getent group nitroctl >/dev/null 2>&1; then
+        run_root groupadd -r nitroctl || {
+            err "Não foi possível criar o grupo nitroctl."
+            return 1
+        }
+    fi
+    # Usuário real: dono da sessão que chamou o instalador.
+    local real_user="${SUDO_USER:-}"
+    if [ -z "$real_user" ] && [ -n "${PKEXEC_UID:-}" ]; then
+        real_user="$(id -nu "$PKEXEC_UID" 2>/dev/null || true)"
+    fi
+    if [ -z "$real_user" ] && [ "$(id -u)" -ne 0 ]; then
+        real_user="$(id -un)"
+    fi
+    if [ -n "$real_user" ] && [ "$real_user" != "root" ]; then
+        if id -nG "$real_user" 2>/dev/null | tr ' ' '\n' | grep -qx nitroctl; then
+            log "$real_user já está no grupo nitroctl"
+        else
+            run_root usermod -aG nitroctl "$real_user" || {
+                err "Não foi possível adicionar $real_user ao grupo nitroctl."
+                return 1
+            }
+        fi
+    fi
+    # A regra é gerada com o usuário real (fallback root = só o grupo).
+    if [ ! -f "$SCRIPT_SELF_DIR/99-nitroctl.rules" ]; then
+        err "setup/99-nitroctl.rules não encontrado."
+        return 1
+    fi
+    local tmp_rule
+    tmp_rule="$(mktemp)" || { err "Não foi possível criar arquivo temporário."; return 1; }
+    sed "s|@NITROCTL_USER@|${real_user:-root}|g" \
+        "$SCRIPT_SELF_DIR/99-nitroctl.rules" > "$tmp_rule"
+    chmod 644 "$tmp_rule"
+    run_root cp "$tmp_rule" /etc/udev/rules.d/99-nitroctl.rules || {
+        rm -f "$tmp_rule"
+        err "Não foi possível instalar a regra udev."
+        return 1
+    }
+    rm -f "$tmp_rule"
+    run_root udevadm control --reload-rules || {
+        err "Não foi possível recarregar as regras udev."
+        return 1
+    }
+    # Aplica já, sem esperar o próximo boot: re-dispara as regras para o
+    # dispositivo existente (o RUN chown/chmod roda na hora).
+    run_root udevadm trigger --subsystem-match=platform --attr-match=driver=acer-wmi 2>/dev/null || true
+
+    cleanup_legacy_passwordless
+    if [ -n "${real_user:-}" ] && [ "$real_user" != "root" ]; then
+        msg "Acesso sem senha ativado para $real_user: 'nitroctl-gui' abre direto.
+O grupo nitroctl também foi configurado para outros usuários (após relogin)."
+    else
+        msg "Regra udev instalada (grupo nitroctl). Para acesso como usuário comum:
+    sudo usermod -aG nitroctl SEU_USUARIO && relogin"
+    fi
+}
+
+# Remove artefatos das versões anteriores da solução sem senha (policy
+# polkit e atalho elevado), que não são mais usados.
+cleanup_legacy_passwordless() {
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+        printf '[dry-run] remover policy polkit antiga e atalho nitroctl-gui-root\n' >&2
+        return 0
+    fi
+    run_root rm -f /usr/share/polkit-1/actions/io.github.nitroctl.gui.policy \
+        /var/lib/polkit-1/actions/io.github.nitroctl.gui.policy 2>/dev/null || true
+    rm -f "$BIN_DIR/nitroctl-gui-root" "$SRC_DIR/nitroctl-gui-root.sh"
 }
 
 uninstall_all() {
@@ -496,9 +646,21 @@ uninstall_all() {
     run_root rm -rf "/usr/src/${DKMS_NAME}-${DKMS_VERSION}"
     run_root rm -f /etc/modprobe.d/blacklist-acer_wmi.conf
     run_root rm -f /etc/systemd/system/linuwu_sense.service
-    run_root systemctl daemon-reload 2>/dev/null || true
+    run_root rm -f /etc/udev/rules.d/99-nitroctl.rules
+    run_root rm -f /usr/share/polkit-1/actions/io.github.nitroctl.gui.policy /var/lib/polkit-1/actions/io.github.nitroctl.gui.policy
+    if command -v udevadm >/dev/null 2>&1; then
+        run_root udevadm control --reload-rules 2>/dev/null || true
+    fi
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        run_root systemctl daemon-reload 2>/dev/null || true
+    fi
     run_root modprobe acer_wmi 2>/dev/null || true
-    rm -f "$BIN_DIR/nitroctl" "$BIN_DIR/nitroctl-gui"
+    rm -f "$BIN_DIR/nitroctl" "$BIN_DIR/nitroctl-gui" "$BIN_DIR/nitroctl-gui-root"
+    rm -f "$HOME/.local/share/applications/nitroctl.desktop"
+    rm -f "$HOME/.local/share/icons/hicolor/scalable/apps/nitroctl.svg"
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
+    fi
     rm -rf "$SRC_DIR"
     msg "nitroctl e driver removidos. O driver original (acer_wmi) volta a ser usado após reiniciar."
 }
@@ -552,15 +714,20 @@ O programa será baixado da internet ($REPO_URL)."; then
         exit 1
     fi
     install_nitroctl || exit 1
-    install_gui_deps
-    install_driver_dkms
+    gui_status=0; install_gui_deps || gui_status=$?
+    driver_status=0; install_driver_dkms || driver_status=$?
     check_path
     check_driver
 
+    if [ "$gui_status" -ne 0 ] || [ "$driver_status" -ne 0 ]; then
+        [ "$gui_status" -ne 0 ] && err "Etapa da GUI falhou (código $gui_status); o CLI pode funcionar sem ela."
+        [ "$driver_status" -ne 0 ] && err "Etapa do driver falhou (código $driver_status); o nitroctl não controla o hardware sem o Linuwu-Sense."
+        exit 1
+    fi
     msg "Instalação concluída.
 
 Linha de comando:  nitroctl
-Interface gráfica: nitroctl-gui (janela GTK4 nativa, eleva sozinha via polkit)"
+Interface gráfica: nitroctl-gui (janela GTK4 nativa, sem senha)"
 }
 
 main "$@"

@@ -1,0 +1,27 @@
+# Permite controlar o hardware Acer sem sudo/senha, direto como usuário.
+#
+# O Linuwu-Sense expõe os controles em /sys/devices/platform/acer-wmi/
+# (grupo nitro_sense/ + hwmon) e o perfil térmico em
+# /sys/firmware/acpi/platform_profile. Por padrão esses nós são root:root
+# 0644/0444 — escrita só para root — e é por isso que a GUI pedia senha.
+#
+# Esta regra dá a POSSE dos nós ao usuário real (@NITROCTL_USER@), além do
+# grupo nitroctl. A posse vale imediatamente (sem relogin): permissão de
+# dono é checada por uid, grupo do processo por gid — e grupo novo só entra
+# em login novo.
+#
+# O instalador substitui @NITROCTL_USER@ pelo usuário que rodou o setup
+# (cópia manual: troque pelo seu nome de usuário). O udev reaplica a
+# posse a cada carga do módulo — boot, atualização de kernel e modprobe.
+
+# Controles do modelo (nitro_sense/ ou predator_sense/).
+SUBSYSTEM=="platform", DRIVER=="acer-wmi", RUN+="/bin/chown -R @NITROCTL_USER@:nitroctl /sys/devices/platform/acer-wmi/nitro_sense /sys/devices/platform/acer-wmi/predator_sense"
+SUBSYSTEM=="platform", DRIVER=="acer-wmi", RUN+="/bin/chmod -R ug+w /sys/devices/platform/acer-wmi/nitro_sense /sys/devices/platform/acer-wmi/predator_sense"
+
+# Sensores hwmon (leitura já é pública; nada a fazer).
+
+# Perfil térmico ACPI. Não há evento udev para /sys/firmware em si, então
+# esta regra pega carona no evento do próprio acer-wmi (que só existe
+# quando o driver carregou) e ajusta o arquivo do firmware junto.
+SUBSYSTEM=="platform", DRIVER=="acer-wmi", RUN+="/bin/chown @NITROCTL_USER@:nitroctl /sys/firmware/acpi/platform_profile"
+SUBSYSTEM=="platform", DRIVER=="acer-wmi", RUN+="/bin/chmod ug+w /sys/firmware/acpi/platform_profile"

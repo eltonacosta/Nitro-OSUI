@@ -46,6 +46,15 @@ def report(result, verb):
         print(f"Skipped {name}: {reason}")
 
 
+def ask(prompt):
+    """input() que trata Ctrl+C e Ctrl+D como cancelamento."""
+    try:
+        return input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+
+
 def thermal_profile_menu():
     cls()
     try:
@@ -61,7 +70,12 @@ def thermal_profile_menu():
         marker = " (current)" if mode == current else ""
         print(f"{idx}: {label}{marker}")
 
-    thermal_profile = input("Type the number of the mode you want to apply, then press enter.\n").strip()
+    raw = ask("Type the number of the mode you want to apply, then press enter.\n")
+    if raw is None:
+        print("Cancelled. Returning to main menu.")
+        time.sleep(1)
+        return
+    thermal_profile = raw.strip()
 
     if thermal_profile.isdigit():
         idx = int(thermal_profile) - 1
@@ -75,6 +89,9 @@ def thermal_profile_menu():
         else:
             print("Invalid selection. Returning to main menu.")
             time.sleep(1)
+    else:
+        print("Invalid selection. Returning to main menu.")
+        time.sleep(1)
 
 
 def toggle_menu(attr, title, on_label="Enabled", off_label="Disabled"):
@@ -94,7 +111,12 @@ def toggle_menu(attr, title, on_label="Enabled", off_label="Disabled"):
         print("Current state unknown.\n")
     print(f"1: {on_label}")
     print(f"2: {off_label}")
-    choice = input("Type the number of your choice, then press enter.\n").strip()
+    raw = ask("Type the number of your choice, then press enter.\n")
+    if raw is None:
+        print("Cancelled. Returning to main menu.")
+        time.sleep(1)
+        return
+    choice = raw.strip()
     if choice in ("1", "2"):
         try:
             core.set_flag(attr, choice == "1")
@@ -111,7 +133,12 @@ def ask_fan_speed(device):
     print(f"Do you want manual or automatic {device} fan control?")
     print("1: Automatic")
     print("2: Manual")
-    choice = input("Type the number of your choice, then press enter.\n").strip()
+    raw = ask("Type the number of your choice, then press enter.\n")
+    if raw is None:
+        print("Cancelled. Returning to main menu.")
+        time.sleep(1)
+        return None
+    choice = raw.strip()
     if choice == "1":
         print(f"Automatic {device} fan control selected.\n")
         return core.FAN_AUTO
@@ -119,10 +146,15 @@ def ask_fan_speed(device):
         print("Unknown state. Returning to main menu.")
         time.sleep(1)
         return None
-    speed = input(
+    speed = ask(
         f"Manual {device} fan control selected. Type your desired fan speed. "
         f"(valid range: {core.FAN_MIN}-{core.FAN_MAX}, {core.FAN_MIN} being the lowest and {core.FAN_MAX} being max.)\n "
-    ).strip()
+    )
+    if speed is None:
+        print("Cancelled. Returning to main menu.")
+        time.sleep(1)
+        return None
+    speed = speed.strip()
     if not core.valid_fan_speed(speed) or int(speed) == core.FAN_AUTO:
         print(f"Invalid input. Please enter a number between {core.FAN_MIN} and {core.FAN_MAX}. Returning to main menu.\n")
         time.sleep(1)
@@ -147,7 +179,12 @@ def fan_speed_menu():
     print("Target speeds are:")
     print(f"CPU Speed: {cpu_speed}")
     print(f"GPU Speed: {gpu_speed}")
-    confirm = input("Is this correct? y/n").strip().lower()
+    raw_confirm = ask("Is this correct? y/n")
+    if raw_confirm is None:
+        print("Returning to main menu.")
+        time.sleep(1)
+        return
+    confirm = raw_confirm.strip().lower()
     if confirm != "y":
         print("Returning to main menu.")
         time.sleep(1)
@@ -173,7 +210,10 @@ def mainloop():
     print("S: Save current configuration")
     print("L: Load configuration from default path [UNTESTED, MIGHT BREAK YOUR SYSTEM!]")
     print("Q: Quit program")
-    return input("Type the number of your choice, then press enter.\n").strip()
+    choice = ask("Type the number of your choice, then press enter.\n")
+    if choice is None:
+        return "q"
+    return choice.strip()
 
 
 def run():

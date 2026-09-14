@@ -40,7 +40,9 @@ class NitroWindow(Adw.ApplicationWindow):
         self.set_title("nitroctl")
         self.set_default_size(560, 720)
 
-        self.can_write = core.is_root()
+        # Habilita escrita quando dá para controlar sem senha (root ou
+        # grupo nitroctl com a regra udev); só pede elevação caso contrário.
+        self.can_write = core.can_control()
 
         # Adw.ApplicationWindow não aceita set_titlebar: o header vai dentro
         # de um Adw.ToolbarView, que é o content da janela.
@@ -71,14 +73,17 @@ class NitroWindow(Adw.ApplicationWindow):
 
         if not self.can_write:
             banner = Adw.Banner.new(
-                "Read-only: restart with 'nitroctl-gui' (it asks for your "
-                "password) to apply changes."
+                "Read-only: run './setup/install.sh --driver-only' once "
+                "(it asks for your password) to enable passwordless control."
             )
             banner.set_revealed(True)
             page.append(banner)
 
         self.profile_group = self._build_profile_group()
         page.append(self.profile_group)
+
+        self.sensor_group = self._build_sensor_group()
+        page.append(self.sensor_group)
 
         self.fan_group = self._build_fan_group()
         page.append(self.fan_group)
@@ -96,6 +101,10 @@ class NitroWindow(Adw.ApplicationWindow):
         page.append(self.status_label)
 
         self.refresh()
+        # O monitor de sensores roda sozinho a cada 800 ms e só toca nos
+        # rótulos de leitura — nunca nos controles, para não brigar com
+        # o usuário no meio de um ajuste.
+        GLib.timeout_add(core.SENSOR_POLL_MS, self._poll_sensors)
 
     # ------------------------------------------------------------ construção
     def _locked_note(self, row: Adw.ActionRow, attr: str) -> None:
@@ -150,6 +159,20 @@ class NitroWindow(Adw.ApplicationWindow):
         page_button_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         page_button_box.append(apply_button)
         group.add(page_button_box)
+        return group
+
+    def _build_sensor_group(self) -> Adw.PreferencesGroup:
+        group = Adw.PreferencesGroup()
+        group.set_title("Sensors")
+        group.set_description("Live readings from the embedded controller (refreshed automatically).")
+
+        self.sensor_rows: dict[str, Adw.ActionRow] = {}
+        for key, label in core.SENSOR_LABELS:
+            row = Adw.ActionRow()
+            row.set_title(label)
+            row.set_subtitle("n/a")
+            group.add(row)
+            self.sensor_rows[key] = row
         return group
 
     def _build_toggle_group(self) -> Adw.PreferencesGroup:
@@ -238,12 +261,26 @@ class NitroWindow(Adw.ApplicationWindow):
             model = core.model_name()
             attrs = ", ".join(core.features()) or "none"
             base = core.driver_base()
+            if base is None or not model:
+                raise core.DriverMissing(
+                    "Driver Linuwu-Sense not found. "
+                    "Install it with './setup/install.sh --driver-only'."
+                )
             interface = f"Interface: {base}/{model}\nDriver attributes: {attrs}"
         except core.DriverMissing as exc:
             interface = str(exc)
         self.status_label.set_text(
             f"{interface}\nKeyboard RGB: not implemented by the upstream project."
         )
+        self._poll_sensors()
+
+    def _poll_sensors(self) -> bool:
+        """Atualiza só os rótulos do cartão Sensors; roda via GLib.timeout_add."""
+        for reading in core.sensor_readings():
+            row = self.sensor_rows.get(reading.key)
+            if row is not None:
+                row.set_subtitle(reading.text)
+        return True
 
     # ----------------------------------------------------------------- ações
     def notify(self, message: str, error: bool = False) -> None:
@@ -350,24 +387,30 @@ class NitroApp(Adw.Application):
 
 
 def ensure_root() -> None:
-    """Reexecuta via pkexec quando aberto como usuário comum.
+    """Reexecuta via pkexec quando o hardware não é gravável.
+
+    Com a regra udev instalada (setup/99-nitroctl.rules), o usuário comum
+    já é dono dos nós do driver e escreve direto — a GUI roda como usuário,
+    sem senha, e esta função retorna de imediato. Sem a regra (instalações
+    antigas, sistemas sem udev), eleva via pkexec, pedindo senha.
 
     Passa --no-elevate para a cópia elevada não tentar se elevar de novo
-    (evitaria um loop caso o pkexec não eleve de fato). Também fixa SHELL
-    para um valor presente em /etc/shells, porque o pkexec reclama quando
-    o shell do usuário não está listado lá, e repassa o display Wayland/X11
-    para o root — sem isso o app elevado não encontra o display e o Gtk
-    falha com "couldn't be initialized".
+    (evitaria um loop caso o pkexec não eleve de fato).
     """
-    if core.is_root():
+    if core.can_control():
         return
+    # Fallback para sistemas sem udev/regra instalada: eleva via pkexec.
+    # O pkexec limpa o ambiente por segurança, então o display Wayland/X11
+    # é repassado explicitamente — sem isso o processo elevado não encontra
+    # o display e o Gtk morre com "couldn't be initialized". O SHELL fixo
+    # evita que o pkexec reclame de shell fora de /etc/shells.
     script = Path(__file__).resolve()
     try:
         env = dict(os.environ, SHELL="/bin/sh")
         keep = ("DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR",
                 "XDG_SESSION_TYPE", "DBUS_SESSION_BUS_ADDRESS")
         preserved = [f"{key}={env[key]}" for key in keep if env.get(key)]
-        subprocess.run(
+        result = subprocess.run(
             ["pkexec", "env", f"SHELL={env['SHELL']}", *preserved,
              sys.executable or "python3", str(script),
              "--no-elevate", *sys.argv[1:]],
@@ -376,10 +419,11 @@ def ensure_root() -> None:
         )
     except FileNotFoundError:
         print(f"pkexec not found; rerun as root: sudo python3 {script}", file=sys.stderr)
-    sys.exit(0)
+        sys.exit(1)
+    sys.exit(result.returncode)
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv=None) -> int:
     args = list(argv if argv is not None else sys.argv[1:])
     if "--no-elevate" not in args:
         ensure_root()

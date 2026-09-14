@@ -9,7 +9,9 @@ from __future__ import annotations
 import os
 import pwd
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional, Union
 
 MODULE_NAME = "linuwu_sense"
 
@@ -39,8 +41,45 @@ FAN_MAX = 100
 # Atributos de liga/desliga expostos pela interface do CLI.
 FLAG_ATTRS = ("backlight_timeout", "battery_limiter", "lcd_override")
 
+# Intervalo do monitor de sensores na GUI (ms).
+SENSOR_POLL_MS = 800
 
-class DriverMissing(RuntimeError):
+# O driver publica RPM e temperaturas via hwmon com nome "acer", como
+# subdispositivo de /sys/devices/platform/acer-wmi. Os canais seguem os
+# IDs do firmware Predator v4 (ver linuwu_sense.c):
+#   temp1 = CPU, temp2 = die da GPU, temp3 = termistor da placa.
+HWMON_NAME = "acer"
+SENSOR_LABELS = (
+    ("cpu_temp", "CPU temperature"),
+    ("gpu_temp", "GPU temperature"),
+    ("board_temp", "Board temperature"),
+    ("cpu_fan", "CPU fan"),
+    ("gpu_fan", "GPU fan"),
+)
+
+_MILLIDEGREE = 1000
+
+
+@dataclass(frozen=True)
+class SensorReading:
+    """Uma leitura do hwmon: value None significa sensor ausente/adormecido."""
+
+    key: str
+    label: str
+    kind: str  # "temp" ou "fan"
+    value: Optional[Union[float, int]]
+    unit: str
+
+    @property
+    def text(self) -> str:
+        if self.value is None:
+            return "n/a"
+        if self.kind == "temp":
+            return f"{self.value:.0f} °C"
+        return f"{self.value} RPM"
+
+
+class DriverMissing(OSError):
     """O driver Linuwu-Sense não está instalado ou não expõe a interface."""
 
 
@@ -52,8 +91,33 @@ def is_root() -> bool:
     return os.geteuid() == 0
 
 
-def driver_base() -> Path | None:
+def _writable(path: Path) -> bool:
+    try:
+        return os.access(path, os.W_OK)
+    except OSError:
+        return False
+
+
+def can_control() -> bool:
+    """Diz se dá para escrever no hardware sem elevar privilégio.
+
+    Verdadeiro para root ou para membro do grupo nitroctl com a regra
+    udev aplicada. A GUI usa isto (não is_root) para decidir se os
+    controles nascem habilitados.
+    """
+    if is_root():
+        return True
+    try:
+        target = sense_dir()
+    except DriverMissing:
+        return False
+    return _writable(target / "fan_speed") or _writable(PLATFORM_PROFILE)
+
+
+def driver_base() -> Optional[Path]:
     """Diretório do driver que contém uma subpasta de modelo, se houver."""
+    if not SENSE_BASES:
+        return None
     for base in SENSE_BASES:
         for model in MODEL_DIRS:
             if (base / model).is_dir():
@@ -62,10 +126,13 @@ def driver_base() -> Path | None:
 
 
 def sense_dir() -> Path:
+    if not SENSE_BASES:
+        raise DriverMissing("Lista de bases do driver vazia; verifique SENSE_BASES.")
     base = driver_base()
     if base is None:
+        bases = " nem em ".join(str(base) for base in SENSE_BASES)
         raise DriverMissing(
-            f"Driver Linuwu-Sense não encontrado em {SENSE_BASES[0]} nem em {SENSE_BASES[1]}. "
+            f"Driver Linuwu-Sense não encontrado em {bases}. "
             "Instale o driver antes de usar o nitroctl."
         )
     for model in MODEL_DIRS:
@@ -102,7 +169,7 @@ def read_attr(attr: str) -> str:
     return path.read_text().strip()
 
 
-def read_attr_or_none(attr: str) -> str | None:
+def read_attr_or_none(attr: str) -> Optional[str]:
     try:
         return read_attr(attr)
     except (DriverMissing, OSError):
@@ -114,7 +181,7 @@ def write_attr(attr: str, value) -> None:
     (sense_dir() / attr).write_text(f"{value}")
 
 
-def read_flag(attr: str) -> bool | None:
+def read_flag(attr: str) -> Optional[bool]:
     """Lê um atributo 0/1. Devolve None quando ausente ou com valor inesperado."""
     raw = read_attr_or_none(attr)
     if raw in ("0", "1"):
@@ -132,7 +199,7 @@ def thermal_profiles() -> list[tuple[str, str]]:
     return [(mode, PROFILE_LABELS.get(mode, mode)) for mode in raw]
 
 
-def current_thermal_profile() -> str | None:
+def current_thermal_profile() -> Optional[str]:
     try:
         return PLATFORM_PROFILE.read_text().strip()
     except OSError:
@@ -145,7 +212,7 @@ def set_thermal_profile(raw_mode: str) -> None:
     PLATFORM_PROFILE.write_text(f"{raw_mode}\n")
 
 
-def fan_speed() -> tuple[int, int] | None:
+def fan_speed() -> Optional[tuple]:
     """Velocidades atuais (cpu, gpu); 0 significa controle automático."""
     raw = read_attr_or_none("fan_speed")
     if not raw:
@@ -169,6 +236,67 @@ def set_fan_speed(cpu: int, gpu: int) -> None:
     if not valid_fan_speed(cpu) or not valid_fan_speed(gpu):
         raise ValueError(f"Velocidade fora da faixa permitida (0 = automático, {FAN_MIN}-{FAN_MAX}).")
     write_attr("fan_speed", f"{cpu},{gpu}")
+
+
+def hwmon_dir() -> Optional[Path]:
+    """Diretório hwmon do driver (nome 'acer'), se o kernel o expôs."""
+    for base in (Path("/sys/devices/platform/acer-wmi/hwmon"), Path("/sys/class/hwmon")):
+        try:
+            candidates = sorted(base.iterdir())
+        except OSError:
+            continue
+        for candidate in candidates:
+            try:
+                if (candidate / "name").read_text().strip() == HWMON_NAME:
+                    return candidate
+            except OSError:
+                continue
+    return None
+
+
+def _read_hwmon_number(path: Path) -> Optional[int]:
+    try:
+        return int(path.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def sensor_readings() -> list[SensorReading]:
+    """RPM das ventoinhas + temperaturas do EC, na ordem de SENSOR_LABELS.
+
+    Leituras ausentes viram value None (ex.: GPU suspensa devolve 0, que
+    significa 'sem sensor', não '0 °C' / '0 RPM'). Nunca levanta: sem
+    hwmon, devolve lista vazia para a GUI mostrar 'n/a'.
+    """
+    directory = hwmon_dir()
+    if directory is None:
+        return []
+    raw = {
+        "temp1": _read_hwmon_number(directory / "temp1_input"),
+        "temp2": _read_hwmon_number(directory / "temp2_input"),
+        "temp3": _read_hwmon_number(directory / "temp3_input"),
+        "fan1": _read_hwmon_number(directory / "fan1_input"),
+        "fan2": _read_hwmon_number(directory / "fan2_input"),
+    }
+    by_key = {
+        "cpu_temp": raw["temp1"],
+        "gpu_temp": raw["temp2"],
+        "board_temp": raw["temp3"],
+        "cpu_fan": raw["fan1"],
+        "gpu_fan": raw["fan2"],
+    }
+    readings = []
+    for key, label in SENSOR_LABELS:
+        value = by_key[key]
+        if value is not None and value <= 0:
+            value = None
+        if "temp" in key:
+            readings.append(SensorReading(key, label, "temp",
+                                         value / _MILLIDEGREE if value is not None else None,
+                                         "°C"))
+        else:
+            readings.append(SensorReading(key, label, "fan", value, "RPM"))
+    return readings
 
 
 def user_home() -> Path:
@@ -217,19 +345,29 @@ def save_config() -> tuple[list[str], list[tuple[str, str]]]:
 def load_config() -> tuple[list[str], list[tuple[str, str]]]:
     """Reaplica em sysfs os valores guardados em ~/.config/nitroctl.
 
-    Devolve (aplicados, pulados). Não há verificação de compatibilidade: o
-    próprio projeto marca esta função como não testada.
+    Devolve (aplicados, pulados), em que pulados são pares (nome, motivo).
+    Só reaplica atributos que o modelo atual expõe; arquivos órfãos
+    (de outro modelo ou de versão antiga do driver) são pulados em vez
+    de criar nós inválidos no sysfs.
     """
     source_dir = config_dir()
     if not source_dir.is_dir():
         raise FileNotFoundError(f"Nenhuma configuração salva em {source_dir}")
+    try:
+        current = sense_dir()
+    except DriverMissing:
+        raise
     applied: list[str] = []
     skipped: list[tuple[str, str]] = []
     for item in sorted(source_dir.iterdir()):
         if not item.is_file():
             continue
+        target = current / item.name
+        if not target.is_file():
+            skipped.append((item.name, "atributo não exposto por este modelo; ignorado"))
+            continue
         try:
-            (sense_dir() / item.name).write_text(item.read_text().strip())
+            target.write_text(item.read_text().strip())
             applied.append(item.name)
         except OSError as exc:
             skipped.append((item.name, str(exc)))

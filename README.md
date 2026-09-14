@@ -175,7 +175,9 @@ The setup script registers Linuwu-Sense with DKMS (`setup/dkms.conf`), applying 
 nitroctl-gui
 ```
 
-It elevates itself: opened as a normal user it asks for your password through polkit (graphical prompt) or `sudo` (terminal fallback), so there is no need to prefix it with `sudo` yourself. Opened without privileges it still shows the driver state read-only.
+It runs without asking for a password: the installer adds a udev rule (`setup/99-nitroctl.rules`) that gives your user ownership of the driver's sysfs controls, and udev re-applies it on every module load (boot, kernel update, `modprobe`). The password is requested only once, during installation.
+
+On systems without udev the rule cannot be installed; in that case the GUI falls back to elevating itself with `pkexec` (graphical prompt) or `sudo` (terminal fallback), and opening it without privileges still shows the driver state read-only.
 
 Both interfaces share the same driver code (`main/nitro_core.py`), so features and validation rules stay in one place.
 
