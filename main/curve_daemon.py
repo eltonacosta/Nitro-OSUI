@@ -33,6 +33,9 @@ import nitro_core as core  # noqa: E402
 
 _running = True
 
+# De quanto em quanto tempo o daemon tenta assumir quando a GUI está aplicando.
+LOCK_WAIT_SECONDS = 3
+
 
 def _stop(_signum, _frame):
     global _running
@@ -114,13 +117,28 @@ def run_loop(tick_seconds: float, verbose: bool) -> int:
               file=sys.stderr)
         return 1
 
+    try:
+        signal.signal(signal.SIGTERM, _stop)
+        signal.signal(signal.SIGINT, _stop)
+    except ValueError:
+        # Sem thread principal (embutido/testes): segue sem handlers; quem
+        # chamou controla o encerramento.
+        pass
+
     lock = fan_curve.CurveLock()
     if not lock.acquire():
-        print("nitroctl-curve: outro processo já aplica a curva (lock ocupado).", file=sys.stderr)
-        return 1
-
-    signal.signal(signal.SIGTERM, _stop)
-    signal.signal(signal.SIGINT, _stop)
+        # Outro aplicador (a GUI) está no comando. Em vez de sair — o que
+        # deixaria a curva pausada quando ele fechasse — espera a vez e assume
+        # sozinho assim que o lock for liberado.
+        if verbose:
+            print("nitroctl-curve: aguardando o outro aplicador soltar o lock…",
+                  file=sys.stderr)
+        while _running and not lock.acquire():
+            time.sleep(LOCK_WAIT_SECONDS)
+        if not lock.held:
+            return 0
+        if verbose:
+            print("nitroctl-curve: assumiu a aplicação da curva", file=sys.stderr)
 
     config = _load_or_default(verbose)
     engine = fan_curve.CurveEngine(config)

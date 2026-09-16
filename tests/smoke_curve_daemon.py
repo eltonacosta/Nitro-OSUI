@@ -93,14 +93,39 @@ assert applied, "o laço deveria ter aplicado a curva"
 assert applied[-1] == (core.FAN_AUTO, core.FAN_AUTO), applied
 print(f"laço OK: {len(applied)} escritas, última {applied[-1]} (automático no encerramento)")
 
-# 7. com o lock ocupado, um segundo aplicador se recusa a escrever
+# 7. com o lock ocupado, o daemon espera a vez e assume quando liberar
+import threading as _threading
+
+applied.clear()
+config = fc.load_config()
+config.enabled = True
+fc.save_config(config)
+
 held = fc.CurveLock()
 held.acquire()
-try:
-    assert daemon.run_loop(0.4, verbose=False) == 1
-    print("concorrência OK: segundo aplicador recusou com o lock ocupado")
-finally:
-    held.release()
+daemon._running = True        # o caso anterior encerrou o laço via SIGTERM
+resultado = {}
+
+
+def _roda():
+    resultado["rc"] = daemon.run_loop(0.4, verbose=True)
+
+
+thread = _threading.Thread(target=_roda, daemon=True)
+thread.start()
+
+time.sleep(1.5)
+assert not applied, "não deveria escrever enquanto espera o lock"
+print("espera OK: não escreve com o lock ocupado pela GUI")
+
+held.release()
+time.sleep(daemon.LOCK_WAIT_SECONDS + 1.5)
+assert applied, "deveria assumir a aplicação depois do lock liberado"
+daemon._running = False       # encerra o laço (o teste roda em thread)
+thread.join(timeout=8)
+assert resultado.get("rc") == 0, resultado
+assert applied[-1] == (core.FAN_AUTO, core.FAN_AUTO), applied
+print(f"assunção OK: assumiu após o lock e restaurou o automático ({applied[-1]})")
 
 print("DAEMON OK: curva aplicada, estado publicado, automático restaurado")
 tmp.cleanup()
