@@ -1,215 +1,65 @@
-# Nitroctl, a CLI NitroSense alternative for Linux, Made thanks to the linuwu-sense driver.
+# Nitro-OSUI (nitroctl)
 
-## What is this?
-A tool made with Python that lets you change keyboard RGB colors, thermal profiles, battery limiter and more using the Linuwu-Sense module. Currently, it works on Nitro devices only. Distro-agnostic, does not depend on systemd. Tested on Void Linux and CachyOS.
+CLI + GTK4 GUI to control Acer Nitro laptops on Linux: keyboard RGB, thermal profiles, battery limiter and fan curves, through the [Linuwu-Sense](https://github.com/0x7375646F/Linuwu-Sense) driver. Nitro devices only; distro-agnostic, no systemd dependency. Tested on Void Linux and CachyOS.
 
-## Why did I make this?
-[Another tool](https://github.com/PXDiv/Div-Acer-Manager-Max) that does the same thing wouldn't work on Void Linux so i decided to make my own, though mine lacks a GUI and is a bit less user friendly.
-
-## Quick install (one-liner)
+## Install
 
 ```bash
-git clone https://github.com/eltonacosta/nitroctl.git && cd nitroctl && ./setup/install.sh
+git clone https://github.com/eltonacosta/Nitro-OSUI.git && cd Nitro-OSUI && ./setup/install.sh
 ```
 
-Non-interactive (accepts every prompt — good for scripts and VMs):
+The installer detects your distro, installs Python, git, kernel headers, the GUI bindings and the driver (via DKMS, rebuilt automatically on kernel updates). Non-interactive: add `--yes`. Preview without changes: `--dry-run --verbose`.
 
 ```bash
-./setup/install.sh --yes
-```
-
-CLI only, driver only, or removal:
-
-```bash
-./setup/install.sh --no-gui          # terminal interface only
+./setup/install.sh --no-gui          # CLI only
 ./setup/install.sh --no-driver       # skip the Linuwu-Sense DKMS step
-./setup/install.sh --driver-only     # only (re)install the driver via DKMS
+./setup/install.sh --driver-only     # only (re)install the driver
+./setup/install.sh --no-autostart    # skip the fan-curve autostart entry
 ./setup/install.sh --uninstall       # remove nitroctl + driver
 ```
 
-Preview what would happen without changing anything:
+Prefer manual? Install [Linuwu-Sense](https://github.com/0x7375646F/Linuwu-Sense), clone this repo and run `./nitroctl.sh` (needs only python3 + git).
 
-```bash
-./setup/install.sh --dry-run --verbose
-```
+Works on Arch, CachyOS, Debian, Ubuntu, Fedora, openSUSE, Void, Alpine and Gentoo; anything else gets generic instructions. Clang-built kernels (like CachyOS) are compiled with LLVM automatically.
 
-Force a specific distro profile (useful in containers or derivatives):
+After installing you get three commands:
 
-```bash
-./setup/install.sh --distro=debian
-```
-
-## How the installer works
-
-The installer is profile-driven instead of hardcoded per distro:
-
-1. **Detect** — reads `/etc/os-release` (`ID`, then `ID_LIKE`) and matches a profile in `setup/distros.conf`. Falls back to whichever package manager exists, then to a `generic` profile with manual instructions.
-2. **Base** — installs Python, git, the matching kernel headers and, only on Clang-built kernels (like CachyOS), the LLVM toolchain.
-3. **App** — clones/updates nitroctl into `~/.local/share/nitroctl` and links `nitroctl` + `nitroctl-gui` into `~/.local/bin`.
-4. **GUI** — installs GTK4/Libadwaita bindings from the system packages (no virtualenv, no ~150 MB download).
-5. **Driver** — clones Linuwu-Sense, applies the Clang compatibility patch (`strncpy` → `memcpy`, guarded), and registers it with DKMS, so kernel updates rebuild the module automatically.
-
-Dialogs adapt to the desktop: `kdialog` (KDE) → `zenity` (GNOME) → `whiptail` (terminal) → plain prompts. Set `NITROCTL_UI` to force one, `NITROCTL_YES=1` for non-interactive mode.
-
-## Supported distributions
-
-| Profile | Distros | Package manager | Base packages | GUI packages | DKMS | Headers | Clang toolchain | Privilege |
-|---|---|---|---|---|---|---|---|---|
-| `cachyos` | CachyOS | pacman | python git base-devel linux-cachyos-headers | python-gobject gtk4 libadwaita | dkms | auto (flavour-aware) | clang llvm lld (auto, kernel is Clang) | sudo |
-| `arch` | Arch, EndeavourOS, Manjaro | pacman | python git base-devel linux-headers | python-gobject gtk4 libadwaita | dkms | auto (flavour-aware) | clang llvm lld (if kernel is Clang) | sudo |
-| `debian` | Debian, Mint, Pop!_OS | apt | python3 git build-essential dkms linux-headers-amd64 | python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 | dkms | auto (`linux-headers-$(uname -r)`) | clang llvm lld (if needed) | sudo |
-| `ubuntu` | Ubuntu + flavours | apt | python3 git build-essential dkms linux-headers-generic | python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 | dkms | auto | clang llvm lld (if needed) | sudo |
-| `fedora` | Fedora, RHEL, Alma, Rocky | dnf | python3 git gcc make kernel-devel kernel-headers dkms | python3-gobject gtk4 libadwaita | dkms | auto (`kernel-devel`) | clang llvm lld (if needed) | sudo |
-| `opensuse` | Leap, Tumbleweed | zypper | python3 git gcc make kernel-devel kernel-default-devel dkms | python3-gobject gtk4 libadwaita | dkms | auto | clang llvm lld (if needed) | sudo |
-| `void` | Void (glibc/musl) | xbps | python3 git base-devel linux-headers dkms | python3-gobject gtk4 libadwaita | dkms | auto | clang llvm lld (if needed) | sudo |
-| `alpine` | Alpine | apk | python3 git build-base linux-headers dkms | python3 gobject-introspection gtk4.0 libadwaita | dkms | `linux-lts-dev` | clang llvm lld (if needed) | doas |
-| `gentoo` | Gentoo | emerge | dev-lang/python dev-vcs/git sys-kernel/linux-headers sys-kernel/dkms | dev-python/pygobject gui-libs/gtk gui-libs/libadwaita | sys-kernel/dkms | manual (your kernel sources) | llvm-core/clang llvm-core/llvm llvm-core/lld | sudo |
-| `generic` | anything else | — | install python3 + git by hand | install GTK4 bindings by hand | — | manual | manual | su |
-
-Notes:
-
-* **Headers follow the running kernel.** On Arch flavours the installer maps `uname -r` to the right `-headers` package (`linux-cachyos-headers`, `linux-zen-headers`, …). On Debian/Ubuntu it uses `linux-headers-$(uname -r)`; on Fedora/RHEL, `kernel-devel`.
-* **LLVM only when needed.** The Clang toolchain is installed only if the running kernel was built with Clang (`CONFIG_CC_IS_CLANG=y`) and `clang` is missing.
-* **Alpine** uses `doas` instead of `sudo` and OpenRC instead of systemd — the driver's systemd unit does not apply there; load the module via `/etc/modules` or `modprobe` after boot.
-* **Gentoo** assumes your kernel sources are already configured; headers come from them.
-* **App grid entry.** The installer writes `~/.local/share/applications/nitroctl.desktop` with an absolute `Exec=` path (`~/.local/bin` is often missing from the graphical launcher's PATH on Debian/Ubuntu/Fedora/openSUSE) plus an hicolor SVG icon, and refreshes the desktop/icon caches when the tools exist (`update-desktop-database`, `gtk-update-icon-cache`). No root needed; works on GNOME, KDE, Xfce, Sway and others following freedesktop.org conventions.
-
-## Prerequisites
-
-This tool depends on python and the [Linuwu-Sense](https://github.com/0x7375646F/Linuwu-Sense) module. The setup script installs and registers it via DKMS automatically; the manual guide below is only for special cases.
-
-The graphical interface (`nitroctl-gui`) is a native GTK4 + Libadwaita app and uses the system Python with PyGObject — no virtualenv, no extra downloads. Install the bindings for your distro (the setup script offers to do this — see the table above).
-
-## Installation via setup script
-
-Just run it — it detects your distro, installs dependencies, the app, the GUI bindings and the driver:
-
-```bash
-./setup/install.sh
-```
-
-When installation finishes, you can run nitroctl from your terminal using:
-
-```bash
-nitroctl
-```
-
-## Manual installation
-
-First, install Linuwu-Sense the same way its done above. Then, proceed with the installation as described below.
-
-### Step 1: Install dependencies
-
-The required dependencies are python3 and git. Package names may be different on your distro — see the table above for the exact packages per distro.
-
-For Debian:
-
-```bash
-sudo apt install python3 git
-```
-
-For Fedora:
-
-```bash
-sudo dnf install python3 git
-```
-
-For Arch:
-
-```bash
-sudo pacman -S python git
-```
-
-For Void:
-
-```bash
-sudo xbps-install -S python3 git
-```
-
-### Step 2: Install nitroctl
-
-Navigate to the destination you want to install nitroctl in your terminal. For example:
-
-```bash
-cd ~/your/destination/
-```
-
-Then, clone this repository:
-
-```bash
-git clone https://github.com/eltonacosta/nitroctl.git
-```
-
-cd into the cloned repository:
-
-```bash
-cd nitroctl
-```
-
-Make nitroctl.sh executable:
-
-```bash
-chmod +x nitroctl.sh
-```
-
-Run nitroctl:
-
-```bash
-./nitroctl.sh
-```
-
-## Arch Linux (and Arch-based distributions)
-
-Everything above applies to Arch; the setup script picks the `arch` (or `cachyos`) profile automatically. Two details matter on Arch-family systems, especially those that ship Clang-built kernels such as CachyOS:
-
-* **Kernel headers**: installed automatically, flavour-aware (`linux-headers`, `linux-cachyos-headers`, `linux-zen-headers`, … depending on `uname -r`).
-* **Clang-built kernels**: Linuwu-Sense does not compile with GCC on those kernels (the kernel itself was built with Clang, and GCC rejects its flags). The installer detects this and builds with `LLVM=1` through DKMS.
-
-The setup script registers Linuwu-Sense with DKMS (`setup/dkms.conf`), applying the Clang compatibility fix (`strncpy` → `memcpy`) at install time. From then on, every kernel update rebuilds and reinstalls the module automatically — no manual recompilation.
-
-## Graphical interface
-
-`nitroctl-gui` offers the same functions as the text menu in a native GTK4 window:
-
-```bash
-nitroctl-gui
-```
-
-It runs without asking for a password: the installer adds a udev rule (`setup/99-nitroctl.rules`) that gives your user ownership of the driver's sysfs controls, and udev re-applies it on every module load (boot, kernel update, `modprobe`). The password is requested only once, during installation.
-
-On systems without udev the rule cannot be installed; in that case the GUI falls back to elevating itself with `pkexec` (graphical prompt) or `sudo` (terminal fallback), and opening it without privileges still shows the driver state read-only.
-
-Both interfaces share the same driver code (`main/nitro_core.py`), so features and validation rules stay in one place.
+* `nitroctl` — text menu
+* `nitroctl-gui` — native GTK4 + Libadwaita window, same features, no password needed (the installer adds a udev rule giving your user access to the driver's sysfs controls)
+* `nitroctl-curve` — fan curve daemon (see below)
 
 ## Fan curve
 
-The firmware only offers "automatic" or a fixed speed per fan — there is no curve in the driver — so nitroctl applies one from userspace. The GUI has a **Fan curve** card with **7 levels per fan** (CPU and GPU), each level with an editable temperature and fan speed; the same levels are editable from the CLI (menu item `7`).
+The firmware only offers "automatic" or a fixed speed, so nitroctl applies a curve from userspace: **7 levels per fan** (CPU/GPU), each with editable temperature and speed, interpolated linearly. Edit in the GUI (Fan curve card) or CLI (menu item `7`) — changes apply immediately.
 
-Rules enforced by the engine (`main/fan_curve.py`):
+Safety rules: never below 20%; suspended GPU holds that fan at 40% idle; failed sensor ramps both fans to 75%; writes only on change, at most every 5 s, with 2 °C hysteresis.
 
-* **Never below 20%.** The editor cannot go lower, and the interpolated result is clamped to 20-100%.
-* **Suspended GPU** (the sensor reports 0, normal when the dGPU sleeps) keeps that fan at a fixed 40% idle speed instead of chasing a reading that does not exist.
-* **Failed reading** (CPU temperature unavailable, or no sensor at all) ramps both fans to 75% as a fail-safe.
-* **Write discipline.** The embedded controller has no rate limiting, so the engine writes only when the value actually changes, at most once every 5 s, with 2 °C of hysteresis on the way down.
-
-Values are interpolated linearly between levels; editing takes effect immediately, without restarting anything.
-
-The curve keeps being applied with the GUI closed: a small daemon (`nitroctl-curve`) starts with your session through XDG autostart (`~/.config/autostart/nitroctl-curve.desktop`), which works on GNOME, KDE, Xfce, Sway and friends without systemd. Useful commands:
+The curve keeps running with the GUI closed via `nitroctl-curve`, started with your session through XDG autostart (works on GNOME, KDE, Xfce, Sway — no systemd). Only one writer at a time; turning the curve off hands the fans back to the firmware.
 
 ```bash
-nitroctl-curve --status        # show the levels and the last report
-nitroctl-curve --once          # apply a single tick (testing/diagnostics)
+nitroctl-curve --status        # show levels and last report
+nitroctl-curve --once          # apply a single tick (diagnostics)
 nitroctl-curve --restore-auto  # hand both fans back to the firmware
 ```
 
-Only one writer exists at a time, guaranteed by a lock (`~/.cache/nitroctl/curve.lock`): while the daemon runs, the GUI edits the configuration and displays the daemon's live state. Turning the curve off — or closing the process that applies it — hands the fans back to the firmware (`0,0`). `./setup/install.sh --no-autostart` skips the autostart entry, and `--uninstall` removes it.
+## Updating
+
+```bash
+nitroctl-update
+```
+
+Pulls the latest code and re-syncs the installed copy — no password, driver and dependencies untouched. If the driver itself changes, run `./setup/install.sh --driver-only`.
 
 ## To Do
 
 * [❌] Keyboard RGB
-* [✅] ~~GUI~~
-* [✅] ~~CPU & GPU temperatures (live sensors card in the GUI, refreshed every 800 ms)~~
-* [✅] ~~Fan curve: 7 levels per fan, minimum 20%, applied by a background daemon~~
 * [❌] Temperatures and fan RPM in the CLI main menu
-* [✅] ~~Finish the installation guide~~
-* [✅] ~~Configuration Save/Load function~~
+* [✅] GUI with live sensors (refreshed every 800 ms)
+* [✅] Fan curve: 7 levels per fan, applied by a background daemon
+* [✅] Config save/load, install guide
+
+## Credits, origin, and AI
+
+Based on the original [nitroctl repository by cani442k](https://github.com/cani442k/nitroctl) — thanks to its author and contributors for the foundation. This fork follows a different idea and direction, with its own goals, features, and design decisions.
+
+AI tools are used in this project's development, and contributors are encouraged to use them to propose improvements and new features. Nothing is accepted automatically: AI-generated or AI-assisted changes land only after human review, testing, and validation for correctness, safety, maintainability, and compatibility.
