@@ -19,6 +19,8 @@
 #   --no-autostart     não instala o autostart do daemon da curva
 #   --no-driver        pula a etapa DKMS/driver
 #   --driver-only      só executa a etapa DKMS/driver e sai
+#   --update           atualiza só o programa (sem deps, sem driver, sem
+#                      perguntas); é o caminho do comando 'nitroctl-update'
 #   --uninstall        remove nitroctl + driver e sai
 #   --distro=ID        força o perfil ID de setup/distros.conf
 #   --dry-run          mostra o que seria feito, sem executar nada
@@ -46,7 +48,7 @@ TITLE="nitroctl"
 # ------------------------------------------------------------------ opções
 OPT_YES=0 OPT_NO_DEPS=0 OPT_NO_GUI=0 OPT_NO_DRIVER=0
 OPT_DRIVER_ONLY=0 OPT_UNINSTALL=0 OPT_DISTRO="" OPT_DRY_RUN=0 OPT_VERBOSE=0
-OPT_NO_AUTOSTART=0
+OPT_NO_AUTOSTART=0 OPT_UPDATE=0
 
 usage() {
     sed -n '2,/^set -u/p' "$0" | sed 's/^# \?//'
@@ -63,6 +65,7 @@ while [ $# -gt 0 ]; do
         --no-deps) OPT_NO_DEPS=1 ;;
         --no-gui) OPT_NO_GUI=1 ;;
         --no-autostart) OPT_NO_AUTOSTART=1 ;;
+        --update) OPT_UPDATE=1; OPT_YES=1; OPT_NO_DEPS=1; OPT_NO_DRIVER=1 ;;
         --no-driver) OPT_NO_DRIVER=1 ;;
         --driver-only) OPT_DRIVER_ONLY=1 ;;
         --uninstall) OPT_UNINSTALL=1 ;;
@@ -403,12 +406,13 @@ install_nitroctl() {
     else
         git clone "$REPO_URL" "$SRC_DIR" || { err "Não foi possível baixar o nitroctl. Verifique a conexão e tente de novo."; return 1; }
     fi
-    for script in nitroctl.sh nitroctl-gui.sh nitroctl-curve.sh; do
+    for script in nitroctl.sh nitroctl-gui.sh nitroctl-curve.sh nitroctl-update.sh; do
         [ -f "$SRC_DIR/$script" ] && chmod +x "$SRC_DIR/$script"
     done
     ln -sf "$SRC_DIR/nitroctl.sh" "$BIN_DIR/nitroctl"
     ln -sf "$SRC_DIR/nitroctl-gui.sh" "$BIN_DIR/nitroctl-gui"
     ln -sf "$SRC_DIR/nitroctl-curve.sh" "$BIN_DIR/nitroctl-curve"
+    ln -sf "$SRC_DIR/nitroctl-update.sh" "$BIN_DIR/nitroctl-update"
 
     # Entrada no menu de aplicativos + ícone (modo gráfico).
     # O Exec usa caminho absoluto: ~/.local/bin pode não estar no PATH que
@@ -427,7 +431,10 @@ install_nitroctl() {
     if command -v gtk-update-icon-cache >/dev/null 2>&1; then
         gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
     fi
-    msg "nitroctl instalado em $SRC_DIR, com os comandos 'nitroctl', 'nitroctl-gui' e 'nitroctl-curve' em $BIN_DIR e entrada no menu de aplicativos."
+    # Registra de onde a instalação veio: o comando 'nitroctl-update' usa isto
+    # para saber qual árvore sincronizar (e onde dar git pull) depois.
+    printf '%s\n' "$REPO_DIR" > "$SRC_DIR/.install-source" 2>/dev/null || true
+    msg "nitroctl instalado em $SRC_DIR, com os comandos 'nitroctl', 'nitroctl-gui', 'nitroctl-curve' e 'nitroctl-update' em $BIN_DIR e entrada no menu de aplicativos."
 }
 
 # ------------------------------------------------- autostart da curva
@@ -453,6 +460,22 @@ install_curve_autostart() {
         "$SCRIPT_SELF_DIR/nitroctl-curve.desktop" \
         > "$HOME/.config/autostart/nitroctl-curve.desktop"
     log "autostart da curva instalado"
+    start_curve_daemon
+}
+
+# Sobe o daemon agora, sem esperar o próximo login (ele fica ocioso enquanto a
+# curva estiver desligada). Sem permissão de escrita ele avisa e sai sozinho.
+start_curve_daemon() {
+    local launcher="$BIN_DIR/nitroctl-curve"
+    [ -x "$launcher" ] || return 0
+    # O padrão é o comando exato do daemon ('python3 .../main/curve_daemon.py'):
+    # assim um editor aberto no arquivo — ou o nome do smoke test — não conta.
+    if command -v pgrep >/dev/null 2>&1 && pgrep -f 'python3 .*/main/curve_daemon\.py' >/dev/null 2>&1; then
+        log "daemon da curva já está rodando"
+        return 0
+    fi
+    nohup "$launcher" >/dev/null 2>&1 &
+    log "daemon da curva iniciado (pid $!)"
 }
 
 install_gui_deps() {
@@ -608,6 +631,18 @@ PYEOF
 # A senha é pedida UMA vez aqui na instalação. Sem udev (containers,
 # sistemas mínimos) a GUI mantém o comportamento antigo: eleva via
 # pkexec/sudo a cada uso.
+# Usuário real por trás da elevação (sudo/pkexec) ou quem está rodando agora.
+detect_real_user() {
+    local user="${SUDO_USER:-}"
+    if [ -z "$user" ] && [ -n "${PKEXEC_UID:-}" ]; then
+        user="$(id -nu "$PKEXEC_UID" 2>/dev/null || true)"
+    fi
+    if [ -z "$user" ] && [ "$(id -u)" -ne 0 ]; then
+        user="$(id -un)"
+    fi
+    printf '%s' "$user"
+}
+
 # Home do usuário real (o $HOME vira /root quando o instalador roda com sudo).
 real_home() {
     local user="$1" home=""
@@ -623,15 +658,25 @@ real_home() {
 # configuração. Devolve ao usuário real quando o instalador roda elevado.
 fix_config_ownership() {
     local user="$1" home
+    user="${user:-$(detect_real_user)}"
     home="$(real_home "$user")"
     [ -n "$user" ] && [ "$user" != "root" ] || return 0
     local dir
     for dir in "$home/.config/nitroctl" "$home/.cache/nitroctl"; do
         [ -d "$dir" ] || continue
-        if [ -n "$(find "$dir" ! -user "$user" -print -quit 2>/dev/null)" ]; then
-            if run_root chown -R "$user" "$dir"; then
-                msg "Corrigido o dono de $dir (estava como root, de instalação antiga)."
-            fi
+        [ -n "$(find "$dir" ! -user "$user" -print -quit 2>/dev/null)" ] || continue
+        # Só pede elevação quando há algo errado: o caso normal não tem custo.
+        if [ "$(id -u)" -eq 0 ]; then
+            chown -R "$user" "$dir" && log "dono corrigido: $dir"
+        elif command -v "${SUDO%% *}" >/dev/null 2>&1; then
+            msg "Ajustando o dono de $dir (arquivos de uma instalação antiga com root)."
+            run_root chown -R "$user" "$dir" || {
+                err "Não foi possível corrigir o dono de $dir agora.
+Rode manualmente: sudo chown -R $user $dir"
+            }
+        else
+            err "Os arquivos em $dir pertencem a outro usuário.
+Rode manualmente: sudo chown -R $user $dir"
         fi
     done
 }
@@ -649,13 +694,8 @@ A GUI vai continuar pedindo senha (pkexec/sudo) a cada abertura."
         }
     fi
     # Usuário real: dono da sessão que chamou o instalador.
-    local real_user="${SUDO_USER:-}"
-    if [ -z "$real_user" ] && [ -n "${PKEXEC_UID:-}" ]; then
-        real_user="$(id -nu "$PKEXEC_UID" 2>/dev/null || true)"
-    fi
-    if [ -z "$real_user" ] && [ "$(id -u)" -ne 0 ]; then
-        real_user="$(id -un)"
-    fi
+    local real_user
+    real_user="$(detect_real_user)"
     if [ -n "$real_user" ] && [ "$real_user" != "root" ]; then
         if id -nG "$real_user" 2>/dev/null | tr ' ' '\n' | grep -qx nitroctl; then
             log "$real_user já está no grupo nitroctl"
@@ -741,6 +781,9 @@ uninstall_all() {
     rm -f "$BIN_DIR/nitroctl-curve"
     rm -f "$HOME/.local/share/applications/nitroctl.desktop"
     rm -f "$HOME/.config/autostart/nitroctl-curve.desktop"
+    if command -v pkill >/dev/null 2>&1; then
+        pkill -f 'python3 .*/main/curve_daemon\.py' 2>/dev/null || true
+    fi
     rm -f "$HOME/.local/share/icons/hicolor/scalable/apps/nitroctl.svg"
     if command -v update-desktop-database >/dev/null 2>&1; then
         update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
@@ -777,6 +820,15 @@ main() {
 
     if [ "$OPT_UNINSTALL" -eq 1 ]; then uninstall_all; exit "$?"; fi
     if [ "$OPT_DRIVER_ONLY" -eq 1 ]; then install_driver_dkms; exit "$?"; fi
+
+    if [ "$OPT_UPDATE" -eq 1 ]; then
+        # Atualização enxuta: só o programa (deps e driver ficam como estão).
+        install_nitroctl || exit 1
+        install_curve_autostart
+        fix_config_ownership "$(detect_real_user)"
+        msg "nitroctl atualizado."
+        exit 0
+    fi
 
     if ! ask_yn "Bem-vindo ao instalador do nitroctl v$VERSION.
 
