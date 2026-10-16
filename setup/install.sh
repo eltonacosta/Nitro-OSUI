@@ -664,7 +664,7 @@ PYEOF
         return 1
     }
     run_root dkms autoinstall -m "$DKMS_NAME" -v "$DKMS_VERSION" || {
-        err "A compilação via DKMS falhou. Veja /var/lib/dkms/${DKMS_NAME}/${DKMS_VERSION}/build/make.log."
+        err "A compilação via DKMS falhou. Veja o make.log em /var/lib/dkms/${DKMS_NAME}/${DKMS_VERSION}/ (build/make.log ou <kernel>/<arch>/log/make.log)."
         return 1
     }
 
