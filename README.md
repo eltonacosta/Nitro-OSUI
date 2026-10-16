@@ -106,7 +106,9 @@ Pulls the latest code and re-syncs the installed copy — no password, driver an
 * [❌] Temperatures and fan RPM in the CLI main menu
 * [✅] GUI with live sensors (refreshed every 800 ms)
 * [✅] Fan curve: 7 levels per fan, applied by a background daemon
-* [✅] Config save/load, reapplied at login, install guide
+* [✅] Config save/load (thermal profile included), reapplied at login, install guide
+* [✅] DKMS rebuild follows each kernel's compiler (GCC or Clang)
+* [✅] Install prompt for AI assistants
 
 ## Credits, origin, and AI
 
