@@ -355,8 +355,8 @@ def mainloop():
     print("5: LCD Overdrive")
     print("6: Keyboard RGB Configuration [UNIMPLEMENTED]")
     print("7: Fan Curve")
-    print("S: Save current configuration")
-    print("L: Load configuration from default path [UNTESTED, MIGHT BREAK YOUR SYSTEM!]")
+    print("S: Save current configuration (reapplied automatically at login)")
+    print("L: Load saved configuration now")
     print("Q: Quit program")
     choice = ask("Type the number of your choice, then press enter.\n")
     if choice is None:
@@ -381,6 +381,7 @@ def run():
             print("Saving configuration to default directory: ~/.config/nitroctl")
             try:
                 report(core.save_config(), "Copied")
+                print("Saved values are reapplied automatically at login (nitroctl-restore).")
             except OSError as exc:
                 print(f"ERROR: {explain(exc)}")
             time.sleep(1)
@@ -401,7 +402,7 @@ def run():
         elif next_function == "7":
             fan_curve_menu()
         elif choice == "l":
-            print(f"Loading previous configuration from {core.config_dir()}")
+            print(f"Loading saved configuration from {core.config_dir()}")
             try:
                 report(core.load_config(), "Loaded")
                 print("Loading finished.")

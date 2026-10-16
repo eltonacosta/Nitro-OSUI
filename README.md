@@ -1,6 +1,6 @@
 # Nitro-OSUI (nitroctl)
 
-CLI + GTK4 GUI to control Acer Nitro laptops on Linux: keyboard RGB, thermal profiles, battery limiter and fan curves, through the [Linuwu-Sense](https://github.com/0x7375646F/Linuwu-Sense) driver. Nitro devices only; distro-agnostic, no systemd dependency. Tested on Void Linux and CachyOS.
+*OSUI = OpenSource UI.* CLI + GTK4 GUI to control Acer Nitro laptops on Linux: keyboard RGB, thermal profiles, battery limiter and fan curves, through the [Linuwu-Sense](https://github.com/0x7375646F/Linuwu-Sense) driver. Nitro devices only; distro-agnostic, no systemd dependency. Tested on Void Linux and CachyOS.
 
 ## Install
 
@@ -14,7 +14,7 @@ The installer detects your distro, installs Python, git, kernel headers, the GUI
 ./setup/install.sh --no-gui          # CLI only
 ./setup/install.sh --no-driver       # skip the Linuwu-Sense DKMS step
 ./setup/install.sh --driver-only     # only (re)install the driver
-./setup/install.sh --no-autostart    # skip the fan-curve autostart entry
+./setup/install.sh --no-autostart    # skip the session autostart entries (fan curve + restore)
 ./setup/install.sh --uninstall       # remove nitroctl + driver
 ```
 
@@ -22,11 +22,12 @@ Prefer manual? Install [Linuwu-Sense](https://github.com/0x7375646F/Linuwu-Sense
 
 Works on Arch, CachyOS, Debian, Ubuntu, Fedora, openSUSE, Void, Alpine and Gentoo; anything else gets generic instructions. Clang-built kernels (like CachyOS) are compiled with LLVM automatically.
 
-After installing you get three commands:
+After installing you get four commands:
 
 * `nitroctl` — text menu
 * `nitroctl-gui` — native GTK4 + Libadwaita window, same features, no password needed (the installer adds a udev rule giving your user access to the driver's sysfs controls)
 * `nitroctl-curve` — fan curve daemon (see below)
+* `nitroctl-restore` — reapplies your saved configuration at login (autostart, see below)
 
 ## Fan curve
 
@@ -42,6 +43,12 @@ nitroctl-curve --once          # apply a single tick (diagnostics)
 nitroctl-curve --restore-auto  # hand both fans back to the firmware
 ```
 
+## Configuration
+
+`S` in the CLI or *Save configuration* in the GUI stores the current values — thermal profile, fan speeds, battery limiter, RGB timeout, USB charging — in `~/.config/nitroctl/`. The firmware resets those on every boot, so `nitroctl-restore` (XDG autostart) writes them back at login. With the fan curve on, the saved `fan_speed` is skipped: the daemon stays in charge of the fans.
+
+`L` in the CLI or *Load configuration* in the GUI applies the same set on demand, and `nitroctl-restore --verbose` shows exactly what was restored.
+
 ## Updating
 
 ```bash
@@ -56,7 +63,7 @@ Pulls the latest code and re-syncs the installed copy — no password, driver an
 * [❌] Temperatures and fan RPM in the CLI main menu
 * [✅] GUI with live sensors (refreshed every 800 ms)
 * [✅] Fan curve: 7 levels per fan, applied by a background daemon
-* [✅] Config save/load, install guide
+* [✅] Config save/load, reapplied at login, install guide
 
 ## Credits, origin, and AI
 

@@ -176,37 +176,55 @@ def validate(config: CurveConfig) -> None:
 
 
 def load_config(path: Optional[Path] = None) -> CurveConfig:
-    """Lê o JSON; devolve a configuração padrão se o arquivo não existir."""
+    """Lê o JSON; devolve a configuração padrão se o arquivo não existir.
+
+    Erro de estrutura ou de valor vira CurveConfigError (nunca TypeError/
+    ValueError solto): os consumidores do arquivo — daemon, GUI e o restore do
+    login — tratam qualquer problema como 'configuração inválida' em vez de
+    morrer com traceback.
+    """
     target = path or config_path()
     try:
         raw = json.loads(target.read_text())
     except FileNotFoundError:
         return default_config()
     except (OSError, json.JSONDecodeError) as exc:
-        raise CurveConfigError(f"não foi possível ler {target}: {exc}")
+        raise CurveConfigError(f"não foi possível ler {target}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise CurveConfigError(f"{target}: o conteúdo deve ser um objeto JSON")
 
-    curves = {}
-    for device in DEVICES:
-        entry = (raw.get("curves") or {}).get(device)
-        if not isinstance(entry, dict):
-            raise CurveConfigError(f"{target}: seção 'curves.{device}' ausente")
-        temps = entry.get("temps")
-        speeds = entry.get("speeds")
-        if not isinstance(temps, list) or not isinstance(speeds, list):
-            raise CurveConfigError(f"{target}: 'temps'/'speeds' de {device} devem ser listas")
-        if len(temps) != len(speeds):
-            raise CurveConfigError(f"{target}: {device} tem {len(temps)} temperaturas e {len(speeds)} velocidades")
-        curves[device] = [(int(t), int(s)) for t, s in zip(temps, speeds)]
+    try:
+        curves = {}
+        entries = raw.get("curves")
+        if not isinstance(entries, dict):
+            raise CurveConfigError(f"{target}: seção 'curves' ausente ou inválida")
+        for device in DEVICES:
+            entry = entries.get(device)
+            if not isinstance(entry, dict):
+                raise CurveConfigError(f"{target}: seção 'curves.{device}' ausente")
+            temps = entry.get("temps")
+            speeds = entry.get("speeds")
+            if not isinstance(temps, list) or not isinstance(speeds, list):
+                raise CurveConfigError(f"{target}: 'temps'/'speeds' de {device} devem ser listas")
+            if len(temps) != len(speeds):
+                raise CurveConfigError(f"{target}: {device} tem {len(temps)} temperaturas e {len(speeds)} velocidades")
+            curves[device] = [(int(t), int(s)) for t, s in zip(temps, speeds)]
 
-    config = CurveConfig(
-        enabled=bool(raw.get("enabled", False)),
-        curves=curves,
-        gpu_idle_speed=raw.get("gpu_idle_speed", DEFAULT_GPU_IDLE_SPEED),
-        fail_safe_speed=raw.get("fail_safe_speed", DEFAULT_FAIL_SAFE_SPEED),
-        hysteresis_c=raw.get("hysteresis_c", DEFAULT_HYSTERESIS_C),
-        min_write_interval_s=raw.get("min_write_interval_s", DEFAULT_MIN_WRITE_INTERVAL_S),
-    )
-    validate(config)
+        config = CurveConfig(
+            enabled=bool(raw.get("enabled", False)),
+            curves=curves,
+            gpu_idle_speed=raw.get("gpu_idle_speed", DEFAULT_GPU_IDLE_SPEED),
+            fail_safe_speed=raw.get("fail_safe_speed", DEFAULT_FAIL_SAFE_SPEED),
+            hysteresis_c=raw.get("hysteresis_c", DEFAULT_HYSTERESIS_C),
+            min_write_interval_s=raw.get("min_write_interval_s", DEFAULT_MIN_WRITE_INTERVAL_S),
+        )
+        validate(config)
+    except CurveConfigError:
+        raise
+    except (TypeError, ValueError, OverflowError) as exc:
+        # JSON estruturalmente válido mas com valores não numéricos
+        # (null, "30 °C", 1e400...): ainda é erro de configuração.
+        raise CurveConfigError(f"{target}: valor inválido no JSON ({exc})") from exc
     return config
 
 
@@ -363,6 +381,11 @@ class CurveEngine:
         self._applier = applier or core.set_fan_speed
         self._clock = clock or time.monotonic
         self.last_applied = None          # (cpu, gpu) escrito por último
+        # Já escreveu um valor fixo e ainda não devolveu o controle ao
+        # firmware: é o sinal de handback (restore_auto), independente de
+        # last_applied — que invalidate_applied() pode zerar sem que o dever
+        # de devolver o automático desapareça.
+        self.has_applied = False
         self.last_write_time = None
         self.last_error = None
         self.last_outcome = None
@@ -419,6 +442,7 @@ class CurveEngine:
             self.last_error = f"falha ao aplicar a curva: {exc}"
             return self.last_error
         self.last_applied = pair
+        self.has_applied = True
         # Guarda as temperaturas que justificaram esta mudança: é a referência
         # da histerese para a próxima descida.
         self._last_change_temp["cpu"] = cpu_temp
@@ -435,10 +459,24 @@ class CurveEngine:
             self.last_error = f"falha ao restaurar o automático: {exc}"
             return self.last_error
         self.last_applied = None
+        self.has_applied = False
         self.last_write_time = None
         self._last_change_temp.clear()
         self.last_error = None
         return None
+
+    def invalidate_applied(self) -> None:
+        """Esquece o último valor aplicado: houve escrita externa no driver.
+
+        Trocar o perfil térmico pode devolver as ventoinhas ao automático por
+        fora deste motor; sem esquecer o último par, o dedupe do próximo tick
+        acharia que o valor ainda está em vigor e nunca o reescreveria. O
+        intervalo mínimo entre escritas continua valendo — a reaplicação chega
+        no tick seguinte. O dever de devolver o automático (`has_applied`)
+        permanece: quem chamou continua responsável pelo handback.
+        """
+        self.last_applied = None
+        self._last_change_temp.clear()
 
 
 def write_state(outcome: Optional[CurveOutcome], applied, error: Optional[str],

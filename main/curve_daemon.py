@@ -6,6 +6,8 @@ que ela continue valendo com a GUI fechada. A cada tick:
 
   * relê a configuração se o arquivo mudou (edição na GUI vale na hora);
   * com a curva ligada, lê as temperaturas e escreve `fan_speed`;
+  * troca de perfil térmico (restore do login, GUI, firmware) invalida o
+    último valor aplicado: a curva reescreve em vez de confiar no dedupe;
   * com a curva desligada, devolve o controle ao firmware (0,0) uma única vez;
   * publica o estado em ~/.cache/nitroctl/curve.state.json para a GUI exibir.
 
@@ -144,6 +146,7 @@ def run_loop(tick_seconds: float, verbose: bool) -> int:
     engine = fan_curve.CurveEngine(config)
     mtime = _config_mtime()
     applied_something = False
+    last_profile = core.current_thermal_profile()
     if verbose:
         print(f"nitroctl-curve: iniciado (curva {'ligada' if config.enabled else 'desligada'})",
               file=sys.stderr)
@@ -160,9 +163,25 @@ def run_loop(tick_seconds: float, verbose: bool) -> int:
                 except fan_curve.CurveConfigError as exc:
                     print(f"nitroctl-curve: configuração inválida ignorada ({exc})", file=sys.stderr)
 
+            # Perfil térmico trocado (restore do login, GUI, firmware) pode
+            # devolver as ventoinhas ao automático por fora deste motor: se o
+            # último valor aplicado não vale mais, a curva reescreve no tick
+            # seguinte em vez de confiar no dedupe.
+            profile = core.current_thermal_profile()
+            if profile != last_profile:
+                last_profile = profile
+                if engine.last_applied is not None:
+                    engine.invalidate_applied()
+                    if verbose:
+                        print("nitroctl-curve: perfil térmico mudou; curva vai reaplicar",
+                              file=sys.stderr)
+
             if config.enabled:
                 error = engine.tick()
-                applied_something = engine.last_applied is not None
+                # has_applied (e não last_applied): uma troca de perfil pode
+                # ter invalidado o último par, mas o dever de devolver o
+                # automático ao desligar/encerrar continua valendo.
+                applied_something = engine.has_applied
                 fan_curve.write_state(engine.last_outcome, engine.last_applied, error, source="daemon")
                 if verbose and error:
                     print(f"nitroctl-curve: {error}", file=sys.stderr)

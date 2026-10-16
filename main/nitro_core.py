@@ -11,7 +11,7 @@ import pwd
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union
+from typing import Mapping, Optional, Union
 
 MODULE_NAME = "linuwu_sense"
 
@@ -40,6 +40,11 @@ FAN_MAX = 100
 
 # Atributos de liga/desliga expostos pela interface do CLI.
 FLAG_ATTRS = ("backlight_timeout", "battery_limiter", "lcd_override")
+
+# Valores salvos que não vivem no diretório do modelo do driver e por isso
+# têm tratamento próprio no save/load: o perfil térmico é uma interface do
+# ACPI (/sys/firmware/acpi/platform_profile), não do Linuwu-Sense.
+EXTRA_ATTRS = ("platform_profile",)
 
 # Intervalo do monitor de sensores na GUI (ms).
 SENSOR_POLL_MS = 800
@@ -372,6 +377,8 @@ def config_dir() -> Path:
 def save_config() -> tuple[list[str], list[tuple[str, str]]]:
     """Copia os atributos atuais para ~/.config/nitroctl.
 
+    Guarda também o perfil térmico (platform_profile, interface do ACPI):
+    sem ele o 'Save configuration' não sobrevive a um boot completo.
     Devolve (salvos, pulados), em que pulados são pares (nome, motivo).
     """
     target_dir = config_dir()
@@ -388,22 +395,78 @@ def save_config() -> tuple[list[str], list[tuple[str, str]]]:
     for item in sorted(sense_dir().iterdir()):
         if not item.is_file():
             continue
+        target = target_dir / item.name
         try:
-            (target_dir / item.name).write_text(item.read_text().strip())
+            target.write_text(item.read_text().strip())
             saved.append(item.name)
         except OSError as exc:
             skipped.append((item.name, str(exc)))
+            continue
+        # Rodando elevado, cada arquivo nasce do root: devolve ao usuário real
+        # (só o diretório não basta — o arquivo ficaria sem escrita para a
+        # próxima execução como usuário).
+        adopt_ownership(target)
+
+    # Perfil térmico (interface do ACPI). Dispositivo que não expõe o arquivo
+    # não ganha item nenhum no relatório — só falha de leitura/escrita é
+    # reportada como pulada.
+    target = target_dir / "platform_profile"
+    if PLATFORM_PROFILE.is_file():
+        profile = current_thermal_profile()
+        if profile:
+            try:
+                target.write_text(f"{profile}\n")
+                saved.append("platform_profile")
+                adopt_ownership(target)
+            except OSError as exc:
+                skipped.append(("platform_profile", str(exc)))
+        else:
+            skipped.append(("platform_profile", "não foi possível ler o perfil térmico atual"))
     adopt_ownership(target_dir, config_dir())
     return saved, skipped
 
 
-def load_config() -> tuple[list[str], list[tuple[str, str]]]:
+def _load_thermal_profile(source_dir: Path, applied: list[str],
+                          skipped: list[tuple[str, str]]) -> None:
+    """Reaplica o platform_profile salvo, validado contra o firmware atual."""
+    profile_file = source_dir / "platform_profile"
+    if not profile_file.is_file():
+        return
+    try:
+        value = profile_file.read_text().strip()
+    except OSError as exc:
+        skipped.append(("platform_profile", str(exc)))
+        return
+    if not value:
+        skipped.append(("platform_profile", "arquivo vazio; ignorado"))
+        return
+    try:
+        set_thermal_profile(value)
+    except ValueError:
+        skipped.append(
+            ("platform_profile",
+             f"'{value}' não é oferecido por este firmware; ignorado")
+        )
+        return
+    except OSError as exc:
+        skipped.append(("platform_profile", str(exc)))
+        return
+    applied.append("platform_profile")
+
+
+def load_config(skip: Optional[Mapping[str, str]] = None) -> tuple[list[str], list[tuple[str, str]]]:
     """Reaplica em sysfs os valores guardados em ~/.config/nitroctl.
 
     Devolve (aplicados, pulados), em que pulados são pares (nome, motivo).
     Só reaplica atributos que o modelo atual expõe; arquivos órfãos
     (de outro modelo ou de versão antiga do driver) são pulados em vez
     de criar nós inválidos no sysfs.
+
+    O perfil térmico salvo é aplicado primeiro: trocar de perfil pode
+    devolver as ventoinhas ao automático, e aí o fan_speed salvo (se houver)
+    volta a ser o último valor escrito. `skip` permite deixar atributos de
+    fora, com o motivo que aparece na lista de pulados (ex.: fan_speed com a
+    curva de ventoinha ligada, em que quem aplica é o nitroctl-curve).
     """
     source_dir = config_dir()
     if not source_dir.is_dir():
@@ -412,10 +475,15 @@ def load_config() -> tuple[list[str], list[tuple[str, str]]]:
         current = sense_dir()
     except DriverMissing:
         raise
+    excluded = dict(skip or {})
     applied: list[str] = []
     skipped: list[tuple[str, str]] = []
+    _load_thermal_profile(source_dir, applied, skipped)
     for item in sorted(source_dir.iterdir()):
-        if not item.is_file():
+        if not item.is_file() or item.name in EXTRA_ATTRS:
+            continue
+        if item.name in excluded:
+            skipped.append((item.name, excluded[item.name]))
             continue
         target = current / item.name
         if not target.is_file():

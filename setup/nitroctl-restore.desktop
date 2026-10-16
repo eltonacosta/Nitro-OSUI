@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=nitroctl restore
+Comment=Reapplies the saved nitroctl configuration at login
+Exec=nitroctl-restore
+Icon=nitroctl
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

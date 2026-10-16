@@ -203,13 +203,14 @@ class GuiCurveTests(unittest.TestCase):
         self.sensor_values = {"cpu_temp": 60.0, "gpu_temp": 50.0}
         self.applied = []
         self.toasts = []
+        self.profile = {"value": "balanced"}
 
         patches = {
             "user_home": lambda: home,
             "can_control": lambda: True,
             "supports": lambda _attr: True,
             "thermal_profiles": lambda: [("balanced", "Balanced")],
-            "current_thermal_profile": lambda: "balanced",
+            "current_thermal_profile": lambda: self.profile["value"],
             "fan_speed": lambda: (0, 0),
             "read_flag": lambda _attr: False,
             "model_name": lambda: "nitro_sense",
@@ -309,6 +310,17 @@ class GuiCurveTests(unittest.TestCase):
         cpu_speed = fc.speed_for(60.0, fc.default_config().points("cpu"))
         gpu_speed = fc.speed_for(50.0, fc.default_config().points("gpu"))
         self.assertEqual(self.applied, [(cpu_speed, gpu_speed)])
+
+    def test_profile_change_makes_the_curve_reapply(self):
+        # Trocar o perfil térmico pode devolver as ventoinhas ao automático;
+        # a curva tem de reescrever em vez de confiar no dedupe.
+        self._enable_curve()
+        self.window.curve_config.min_write_interval_s = 0  # não esperar 5 s
+        self.window._curve_tick()
+        self.assertEqual(len(self.applied), 1)
+        self.profile["value"] = "quiet"
+        self.window._curve_tick()
+        self.assertEqual(len(self.applied), 2, "deveria reaplicar após a troca de perfil")
 
     def test_tick_does_nothing_while_disabled(self):
         self.window._curve_tick()

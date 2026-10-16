@@ -57,6 +57,7 @@ class NitroWindow(Adw.ApplicationWindow):
         self._curve_lock = None
         self._curve_engine = None
         self._curve_toggling = False
+        self._last_profile = None
         self._driver_available = bool(core.driver_base())
 
         # Adw.ApplicationWindow não aceita set_titlebar: o header vai dentro
@@ -278,7 +279,7 @@ class NitroWindow(Adw.ApplicationWindow):
     def _build_config_group(self) -> Adw.PreferencesGroup:
         group = Adw.PreferencesGroup()
         group.set_title("Configuration")
-        group.set_description(f"Files saved in {core.config_dir()}")
+        group.set_description(f"Saved in {core.config_dir()} and reapplied at login.")
 
         buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         buttons.set_margin_top(12)
@@ -505,6 +506,13 @@ class NitroWindow(Adw.ApplicationWindow):
                 self._curve_lock = lock
                 self._curve_engine = fan_curve.CurveEngine(self.curve_config)
         if self._curve_engine is not None:
+            # Perfil térmico trocado (aqui ou por fora) pode devolver as
+            # ventoinhas ao automático: invalida o último valor para a curva
+            # reescrever em vez de confiar no dedupe.
+            profile = core.current_thermal_profile()
+            if profile != self._last_profile:
+                self._last_profile = profile
+                self._curve_engine.invalidate_applied()
             if self.curve_config.enabled:
                 error = self._curve_engine.tick()
                 fan_curve.write_state(self._curve_engine.last_outcome,
@@ -601,8 +609,8 @@ class NitroWindow(Adw.ApplicationWindow):
         dialog = Adw.AlertDialog()
         dialog.set_heading("Load saved configuration?")
         dialog.set_body(
-            "The upstream project marks this feature as untested and warns that it may "
-            "break your system. The saved values are written straight to the driver."
+            "The saved values are written straight to the driver. The same "
+            "configuration is reapplied automatically at login by nitroctl-restore."
         )
         dialog.add_response("cancel", "Cancel")
         dialog.add_response("load", "Load")

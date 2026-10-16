@@ -29,12 +29,15 @@ def readings():
         core.SensorReading("gpu_fan", "GPU fan", "fan", 2500, "RPM"),
     ]
 
+profile_state = {"value": "balanced"}
+
 for name, value in (
     ("user_home", lambda: home),
     ("can_control", lambda: True),
     ("supports", lambda _attr: True),
     ("sensor_readings", readings),
     ("set_fan_speed", lambda cpu, gpu: applied.append((cpu, gpu))),
+    ("current_thermal_profile", lambda: profile_state["value"]),
 ):
     mock.patch.object(core, name, value).start()
 
@@ -126,6 +129,56 @@ thread.join(timeout=8)
 assert resultado.get("rc") == 0, resultado
 assert applied[-1] == (core.FAN_AUTO, core.FAN_AUTO), applied
 print(f"assunção OK: assumiu após o lock e restaurou o automático ({applied[-1]})")
+
+# 8. troca de perfil térmico: a curva reescreve em vez de confiar no dedupe
+applied.clear()
+config = fc.load_config()
+config.enabled = True
+config.min_write_interval_s = 0   # o teste não pode esperar 5 s
+fc.save_config(config)
+profile_state["value"] = "balanced"
+daemon._running = True
+resultado = {}
+thread = _threading.Thread(target=lambda: resultado.update(rc=daemon.run_loop(0.4, verbose=False)),
+                           daemon=True)
+thread.start()
+time.sleep(1.0)
+assert len(applied) == 1, f"dedupe deveria segurar as repetições: {applied}"
+profile_state["value"] = "quiet"  # restore do login/GUI trocou o perfil
+time.sleep(1.0)
+assert len(applied) >= 2, "a curva deveria reaplicar depois da troca de perfil"
+daemon._running = False
+thread.join(timeout=8)
+assert resultado.get("rc") == 0, resultado
+print(f"perfil OK: perfil trocado por fora fez a curva reaplicar ({len(applied)} escritas)")
+
+# 9. janela do intervalo mínimo: mesmo com o perfil invalidado, desligar a
+#    curva ou encerrar o daemon precisa devolver o automático (0,0)
+applied.clear()
+config = fc.load_config()
+config.enabled = True
+config.min_write_interval_s = 5   # a reaplicação vai ficar pendente
+fc.save_config(config)
+profile_state["value"] = "balanced"
+daemon._running = True
+resultado = {}
+thread = _threading.Thread(target=lambda: resultado.update(rc=daemon.run_loop(0.4, verbose=False)),
+                           daemon=True)
+thread.start()
+time.sleep(1.0)
+assert len(applied) == 1, applied
+profile_state["value"] = "quiet"  # troca de perfil: invalida, reaplicação pendente
+time.sleep(0.4)
+config = fc.load_config()         # usuário desliga a curva dentro da janela
+config.enabled = False
+fc.save_config(config)
+time.sleep(1.5)
+assert applied[-1] == (core.FAN_AUTO, core.FAN_AUTO), \
+    f"handback (0,0) não pode ser pulado: {applied}"
+daemon._running = False
+thread.join(timeout=8)
+assert resultado.get("rc") == 0, resultado
+print("handback OK: desligar dentro da janela do intervalo mínimo devolveu o automático")
 
 print("DAEMON OK: curva aplicada, estado publicado, automático restaurado")
 tmp.cleanup()

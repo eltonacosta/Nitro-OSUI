@@ -7,7 +7,8 @@
 #      perfil de setup/distros.conf (--distro=ID força um perfil);
 #   2. instala base (python+git+headers), GUI GTK4 e DKMS conforme o perfil;
 #   3. instala o nitroctl (CLI + GUI) em ~/.local;
-#   4. registra o Linuwu-Sense no DKMS com o patch Clang (LLVM=1).
+#   4. registra o Linuwu-Sense no DKMS (a toolchain segue o kernel alvo:
+#      Clang usa LLVM=1, GCC usa o make padrão).
 #
 # Uso:
 #   ./install.sh [opções]
@@ -16,7 +17,7 @@
 #   --yes              responde "sim" a todas as perguntas (não-interativo)
 #   --no-deps          pula a instalação de dependências da base
 #   --no-gui           pula as dependências da GUI (só CLI)
-#   --no-autostart     não instala o autostart do daemon da curva
+#   --no-autostart     não instala os autostarts da sessão (curva + restore)
 #   --no-driver        pula a etapa DKMS/driver
 #   --driver-only      só executa a etapa DKMS/driver e sai
 #   --update           atualiza só o programa (sem deps, sem driver, sem
@@ -32,7 +33,7 @@
 #   NITROCTL_YES=1                              equivale a --yes
 set -u
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 REPO_URL="https://github.com/eltonacosta/nitroctl.git"
 DRIVER_URL="https://github.com/0x7375646F/Linuwu-Sense.git"
 # Raiz dos arquivos do nitroctl. Deriva do local deste script (não de $HOME):
@@ -286,12 +287,20 @@ resolve_headers_pkg() {
     case "$P_HEADERS" in
         auto:pacman)
             if [ -d "/usr/lib/modules/$kver/build" ]; then printf ''; return 0; fi
+            # Dono do kernel em execução (linux, linux-lts, linux-cachyos-lts…):
+            # o pacote de headers é "<pacote>-headers". O padrão por sufixo
+            # errava flavours do CachyOS — cachyos-lts caía em linux-lts-headers,
+            # headers de outro kernel, e o rebuild DKMS falhava por falta dos
+            # headers certos.
+            local owner
+            owner="$(pacman -Qoq "/usr/lib/modules/$kver/vmlinuz" 2>/dev/null)" || owner=""
+            if [ -n "$owner" ]; then printf '%s-headers' "$owner"; return 0; fi
             case "$kver" in
                 *-cachyos) printf 'linux-cachyos-headers' ;;
+                *-cachyos-lts*) printf 'linux-cachyos-lts-headers' ;;
                 *-lts*) printf 'linux-lts-headers' ;;
                 *-zen*) printf 'linux-zen-headers' ;;
                 *-hardened*) printf 'linux-hardened-headers' ;;
-                *-lts) printf 'linux-lts-headers' ;;
                 *) printf 'linux-headers' ;;
             esac
             ;;
@@ -314,9 +323,22 @@ resolve_headers_pkg() {
     esac
 }
 
+# Detecta o compilador do kernel em execução: decide se a toolchain Clang é
+# necessária. Usa a mesma chave que o DKMS usa para o LLVM=1
+# (CONFIG_CC_IS_CLANG), procurando nos caminhos reais de cada distro:
+# .config (Arch/CachyOS, Fedora, openSUSE, Void), include/config/auto.conf
+# (Debian/Ubuntu) e /boot/config-* (Debian/Ubuntu/Fedora) — e, no limite,
+# /proc/version, que traz a assinatura de compilação do kernel em execução.
 kernel_is_clang() {
-    local kdir="/lib/modules/$(uname -r)/build/.config"
-    [ -r "$kdir" ] && grep -q "^CONFIG_CC_IS_CLANG=y" "$kdir"
+    local kver kdir cfg
+    kver="$(uname -r)"
+    kdir="/lib/modules/$kver/build"
+    for cfg in "$kdir/.config" "$kdir/include/config/auto.conf" "/boot/config-$kver"; do
+        [ -r "$cfg" ] || continue
+        grep -q '^CONFIG_CC_IS_CLANG=y' "$cfg" && return 0
+        grep -q '^CONFIG_CC_IS_GCC=y' "$cfg" && return 1
+    done
+    grep -qi 'clang' /proc/version 2>/dev/null
 }
 
 # -------------------------------------------------------------- instalação
@@ -406,12 +428,13 @@ install_nitroctl() {
     else
         git clone "$REPO_URL" "$SRC_DIR" || { err "Não foi possível baixar o nitroctl. Verifique a conexão e tente de novo."; return 1; }
     fi
-    for script in nitroctl.sh nitroctl-gui.sh nitroctl-curve.sh nitroctl-update.sh; do
+    for script in nitroctl.sh nitroctl-gui.sh nitroctl-curve.sh nitroctl-restore.sh nitroctl-update.sh; do
         [ -f "$SRC_DIR/$script" ] && chmod +x "$SRC_DIR/$script"
     done
     ln -sf "$SRC_DIR/nitroctl.sh" "$BIN_DIR/nitroctl"
     ln -sf "$SRC_DIR/nitroctl-gui.sh" "$BIN_DIR/nitroctl-gui"
     ln -sf "$SRC_DIR/nitroctl-curve.sh" "$BIN_DIR/nitroctl-curve"
+    ln -sf "$SRC_DIR/nitroctl-restore.sh" "$BIN_DIR/nitroctl-restore"
     ln -sf "$SRC_DIR/nitroctl-update.sh" "$BIN_DIR/nitroctl-update"
 
     # Entrada no menu de aplicativos + ícone (modo gráfico).
@@ -434,7 +457,7 @@ install_nitroctl() {
     # Registra de onde a instalação veio: o comando 'nitroctl-update' usa isto
     # para saber qual árvore sincronizar (e onde dar git pull) depois.
     printf '%s\n' "$REPO_DIR" > "$SRC_DIR/.install-source" 2>/dev/null || true
-    msg "nitroctl instalado em $SRC_DIR, com os comandos 'nitroctl', 'nitroctl-gui', 'nitroctl-curve' e 'nitroctl-update' em $BIN_DIR e entrada no menu de aplicativos."
+    msg "nitroctl instalado em $SRC_DIR, com os comandos 'nitroctl', 'nitroctl-gui', 'nitroctl-curve', 'nitroctl-restore' e 'nitroctl-update' em $BIN_DIR e entrada no menu de aplicativos."
 }
 
 # ------------------------------------------------- autostart da curva
@@ -478,6 +501,43 @@ start_curve_daemon() {
     log "daemon da curva iniciado (pid $!)"
 }
 
+# ------------------------------------------------- reconfiguração da sessão
+# Os atributos do driver (bateria, RGB do teclado, ventoinhas…) voltam aos
+# padrões da firmware a cada boot, porque o módulo relê o EC ao carregar.
+# O nitroctl-restore devolve, uma vez por login, o que foi salvo com o
+# 'Save configuration' — a curva de ventoinha continua a cargo do daemon.
+install_restore_autostart() {
+    if [ "$OPT_NO_AUTOSTART" -eq 1 ]; then
+        log "autostart da reconfiguração pulado (--no-autostart)"
+        return 0
+    fi
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+        printf '[dry-run] escrever %s (reconfiguração da sessão)\n' "$HOME/.config/autostart/nitroctl-restore.desktop" >&2
+        return 0
+    fi
+    if [ ! -f "$SCRIPT_SELF_DIR/nitroctl-restore.desktop" ]; then
+        log "setup/nitroctl-restore.desktop ausente; autostart não instalado"
+        return 0
+    fi
+    mkdir -p "$HOME/.config/autostart"
+    sed "s|^Exec=nitroctl-restore|Exec=$BIN_DIR/nitroctl-restore|" \
+        "$SCRIPT_SELF_DIR/nitroctl-restore.desktop" \
+        > "$HOME/.config/autostart/nitroctl-restore.desktop"
+    log "autostart da reconfiguração instalado"
+}
+
+# Reaplica agora o que estiver salvo (instalação/atualização/--driver-only).
+# Sem espera: o caminho interativo já tem o driver carregado, ou a máquina
+# não tem o driver mesmo — quem espera o módulo subir é o autostart do login.
+apply_saved_config() {
+    [ "$OPT_DRY_RUN" -eq 1 ] && return 0
+    local launcher="$BIN_DIR/nitroctl-restore"
+    [ -x "$launcher" ] || return 0
+    if ! "$launcher" --wait 0; then
+        log "reconfiguração: nada aplicado agora (driver ausente ou sem permissão)"
+    fi
+}
+
 install_gui_deps() {
     if [ "$OPT_NO_GUI" -eq 1 ]; then
         log "GUI pulada (--no-gui)"
@@ -501,15 +561,16 @@ install_driver_dkms() {
         msg "AVISO: este perfil não prevê DKMS. Instale o Linuwu-Sense manualmente ($DRIVER_URL) e recompile a cada atualização de kernel."
         return 0
     fi
-    if ! command -v dkms >/dev/null 2>&1; then
-        install_packages "DKMS" "$P_DKMS" || return 1
-    fi
 
     local dkms_src="/usr/src/${DKMS_NAME}-${DKMS_VERSION}"
     local workdir
+    # --dry-run só descreve: não instala pacotes, não pede senha.
     if [ "$OPT_DRY_RUN" -eq 1 ]; then
-        printf '[dry-run] clonar %s, aplicar patch Clang, copiar para %s, dkms add+autoinstall\n' "$DRIVER_URL" "$dkms_src" >&2
+        printf '[dry-run] clonar %s, aplicar patch Clang, copiar para %s, atualizar /etc/dkms/%s-%s.conf, dkms add+autoinstall\n' "$DRIVER_URL" "$dkms_src" "$DKMS_NAME" "$DKMS_VERSION" >&2
         return 0
+    fi
+    if ! command -v dkms >/dev/null 2>&1; then
+        install_packages "DKMS" "$P_DKMS" || return 1
     fi
     workdir="$(mktemp -d)" || { err "Não foi possível criar diretório temporário."; return 1; }
     git clone --depth 1 "$DRIVER_URL" "$workdir/Linuwu-Sense" || {
@@ -554,6 +615,22 @@ PYEOF
     cp "$SCRIPT_SELF_DIR/dkms.conf" "$workdir/Linuwu-Sense/dkms.conf" || {
         rm -rf "$workdir"
         err "setup/dkms.conf não encontrado no nitroctl baixado."
+        return 1
+    }
+    # O mesmo arquivo vai para o override do DKMS em /etc/dkms/, que o DKMS
+    # lê DEPOIS do dkms.conf da árvore. O nome leva a versão do módulo
+    # (ordenamento de especificidade do DKMS) para não interferir em outra
+    # versão de linuwu_sense que exista na máquina — e, ao mesmo tempo,
+    # sobrepõe um /etc/dkms/${DKMS_NAME}.conf antigo (o workaround manual
+    # comum para o LLVM=1 fixo), garantindo a lógica de toolchain por kernel.
+    run_root mkdir -p /etc/dkms || {
+        rm -rf "$workdir"
+        err "Não foi possível criar /etc/dkms."
+        return 1
+    }
+    run_root cp "$SCRIPT_SELF_DIR/dkms.conf" "/etc/dkms/${DKMS_NAME}-${DKMS_VERSION}.conf" || {
+        rm -rf "$workdir"
+        err "Não foi possível instalar /etc/dkms/${DKMS_NAME}-${DKMS_VERSION}.conf."
         return 1
     }
     run_root rm -rf "$dkms_src"
@@ -759,13 +836,14 @@ uninstall_all() {
         exit 1
     fi
     if [ "$OPT_DRY_RUN" -eq 1 ]; then
-        printf '[dry-run] dkms remove, rm -rf %s, rm links em %s, modprobe acer_wmi\n' "/usr/src/${DKMS_NAME}-${DKMS_VERSION}" "$BIN_DIR" >&2
+        printf '[dry-run] dkms remove, rm -rf %s, rm links em %s, /etc/dkms/%s-%s.conf, modprobe acer_wmi\n' "/usr/src/${DKMS_NAME}-${DKMS_VERSION}" "$BIN_DIR" "$DKMS_NAME" "$DKMS_VERSION" >&2
         return 0
     fi
     if command -v dkms >/dev/null 2>&1; then
         run_root dkms remove -m "$DKMS_NAME" -v "$DKMS_VERSION" --all 2>/dev/null || true
     fi
     run_root rm -rf "/usr/src/${DKMS_NAME}-${DKMS_VERSION}"
+    run_root rm -f "/etc/dkms/${DKMS_NAME}-${DKMS_VERSION}.conf"
     run_root rm -f /etc/modprobe.d/blacklist-acer_wmi.conf
     run_root rm -f /etc/systemd/system/linuwu_sense.service
     run_root rm -f /etc/udev/rules.d/99-nitroctl.rules
@@ -778,9 +856,10 @@ uninstall_all() {
     fi
     run_root modprobe acer_wmi 2>/dev/null || true
     rm -f "$BIN_DIR/nitroctl" "$BIN_DIR/nitroctl-gui" "$BIN_DIR/nitroctl-gui-root"
-    rm -f "$BIN_DIR/nitroctl-curve"
+    rm -f "$BIN_DIR/nitroctl-curve" "$BIN_DIR/nitroctl-restore"
     rm -f "$HOME/.local/share/applications/nitroctl.desktop"
     rm -f "$HOME/.config/autostart/nitroctl-curve.desktop"
+    rm -f "$HOME/.config/autostart/nitroctl-restore.desktop"
     if command -v pkill >/dev/null 2>&1; then
         pkill -f 'python3 .*/main/curve_daemon\.py' 2>/dev/null || true
     fi
@@ -819,13 +898,20 @@ main() {
     log "install.sh v$VERSION | perfil=$P_ID pm=$P_PM sudo=$SUDO dry-run=$OPT_DRY_RUN"
 
     if [ "$OPT_UNINSTALL" -eq 1 ]; then uninstall_all; exit "$?"; fi
-    if [ "$OPT_DRIVER_ONLY" -eq 1 ]; then install_driver_dkms; exit "$?"; fi
+    if [ "$OPT_DRIVER_ONLY" -eq 1 ]; then
+        install_driver_dkms
+        driver_status=$?
+        [ "$driver_status" -eq 0 ] && apply_saved_config
+        exit "$driver_status"
+    fi
 
     if [ "$OPT_UPDATE" -eq 1 ]; then
         # Atualização enxuta: só o programa (deps e driver ficam como estão).
         install_nitroctl || exit 1
         install_curve_autostart
+        install_restore_autostart
         fix_config_ownership "$(detect_real_user)"
+        apply_saved_config
         msg "nitroctl atualizado."
         exit 0
     fi
@@ -851,8 +937,12 @@ O programa será baixado da internet ($REPO_URL)."; then
     fi
     install_nitroctl || exit 1
     install_curve_autostart
+    install_restore_autostart
     gui_status=0; install_gui_deps || gui_status=$?
     driver_status=0; install_driver_dkms || driver_status=$?
+    # Depois do driver montado (e só então), devolve o que estiver salvo:
+    # no boot é o autostart do nitroctl-restore que faz isso.
+    if [ "$driver_status" -eq 0 ]; then apply_saved_config; fi
     check_path
     check_driver
 

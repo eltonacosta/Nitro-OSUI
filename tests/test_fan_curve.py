@@ -226,6 +226,28 @@ class EngineTests(unittest.TestCase):
         self.assertIsNotNone(error)
         self.assertEqual(engine.last_applied, None)
 
+    def test_invalidate_applied_forces_rewrite(self):
+        # Troca de perfil térmico devolve as ventoinhas ao automático por fora:
+        # o motor precisa esquecer o último valor e reescrever.
+        engine, _ = self.make_engine()
+        engine.tick()
+        engine.tick()
+        self.assertEqual(len(self.written), 1)
+        engine.invalidate_applied()
+        self.now += 5.0
+        engine.tick()
+        self.assertEqual(len(self.written), 2, "deveria reescrever o mesmo valor")
+
+    def test_invalidate_applied_keeps_the_handback_duty(self):
+        # last_applied pode ser zerado; o dever de devolver o automático não.
+        engine, _ = self.make_engine()
+        engine.tick()
+        engine.invalidate_applied()
+        self.assertTrue(engine.has_applied)
+        self.assertIsNone(engine.last_applied)
+        engine.restore_auto()
+        self.assertFalse(engine.has_applied)
+
 
 class ConfigFileTests(unittest.TestCase):
     def test_save_load_roundtrip(self):
@@ -246,6 +268,31 @@ class ConfigFileTests(unittest.TestCase):
         loaded = fc.load_config(Path("/nonexistent/fan_curve.json"))
         self.assertFalse(loaded.enabled)
         self.assertEqual(len(loaded.points("cpu")), fc.LEVELS)
+
+    def test_non_numeric_values_raise_config_error(self):
+        # JSON válido, valor inválido: precisa virar CurveConfigError (é o que
+        # daemon, GUI e o restore do login sabem tratar), não ValueError solto.
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "fan_curve.json"
+            data = fc.default_config().to_dict()
+            data["curves"]["cpu"]["temps"][2] = "50 °C"
+            path.write_text(json.dumps(data))
+            with self.assertRaises(fc.CurveConfigError):
+                fc.load_config(path)
+            data["curves"]["cpu"]["temps"][2] = None
+            path.write_text(json.dumps(data))
+            with self.assertRaises(fc.CurveConfigError):
+                fc.load_config(path)
+
+    def test_non_object_json_raises_config_error(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "fan_curve.json"
+            path.write_text("[1, 2, 3]")
+            with self.assertRaises(fc.CurveConfigError):
+                fc.load_config(path)
 
 
 class LockTests(unittest.TestCase):
