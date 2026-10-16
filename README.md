@@ -29,6 +29,49 @@ After installing you get four commands:
 * `nitroctl-curve` — fan curve daemon (see below)
 * `nitroctl-restore` — reapplies your saved configuration at login (autostart, see below)
 
+### Install with an AI assistant
+
+Copy the prompt below into your AI coding agent (Claude Code, opencode, Codex, Gemini CLI…) and it will check the requirements, preview the changes and walk through the install with you.
+
+```text
+Install nitroctl (https://github.com/eltonacosta/Nitro-OSUI) on this Linux machine.
+
+nitroctl is a CLI + GTK4 GUI for Acer Nitro laptops: keyboard RGB, thermal
+profiles, battery limiter and fan curves. It controls the hardware through the
+Linuwu-Sense kernel driver, built from source and rebuilt on kernel updates
+via DKMS.
+
+1. Check the requirements; if any fails, stop and report instead of continuing:
+   - Linux on an Acer Nitro/Predator: cat /sys/class/dmi/id/sys_vendor and /sys/class/dmi/id/product_name;
+   - the user can run sudo (needed for packages, DKMS, udev and the system service);
+   - internet access; the installer adds kernel headers when they are missing.
+2. Clone the repository and read README.md and setup/install.sh before running anything:
+   git clone https://github.com/eltonacosta/Nitro-OSUI.git && cd Nitro-OSUI
+3. Show the user what the installer plans to do and ask for explicit approval:
+   ./setup/install.sh --dry-run --verbose
+   It installs distro packages (python3, git, kernel headers, GTK4 bindings,
+   DKMS, and the Clang toolchain when the kernel needs it), registers the
+   Linuwu-Sense driver in DKMS, adds a udev rule for passwordless control and
+   installs the fan-curve and session-restore autostart entries.
+4. Run it — it asks for the user's password: ./setup/install.sh
+   Use --yes only if the user explicitly authorized a non-interactive install.
+   Do not edit the sources and do not bypass installer checks. On failure, read
+   the make.log it points to (e.g. /var/lib/dkms/linuwu_sense/1.0/<kernel>/<arch>/log/make.log)
+   and report the exact error instead of guessing.
+5. Verify and report the evidence:
+   - dkms status shows linuwu_sense/1.0 installed for the running kernel;
+   - lsmod | grep linuwu_sense shows the module loaded;
+   - command -v nitroctl nitroctl-gui nitroctl-curve nitroctl-restore;
+   - nitroctl-curve --status and, on systemd, systemctl status linuwu_sense.service.
+   If the module is not loaded, reboot and check again.
+6. Tell the user how to use it (nitroctl, nitroctl-gui), that saved settings are
+   reapplied at login by nitroctl-restore, and how to undo everything:
+   ./setup/install.sh --uninstall
+
+Never skip step 3, and never run destructive or system-wide commands beyond
+what the installer does.
+```
+
 ## Fan curve
 
 The firmware only offers "automatic" or a fixed speed, so nitroctl applies a curve from userspace: **7 levels per fan** (CPU/GPU), each with editable temperature and speed, interpolated linearly. Edit in the GUI (Fan curve card) or CLI (menu item `7`) — changes apply immediately.
